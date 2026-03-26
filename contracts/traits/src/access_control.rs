@@ -96,6 +96,16 @@ pub struct AccessControl {
     cache_ttl_blocks: u32,
 }
 
+impl core::fmt::Debug for AccessControl {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AccessControl")
+            .field("audit_count", &self.audit_count)
+            .field("cache_epoch", &self.cache_epoch)
+            .field("cache_ttl_blocks", &self.cache_ttl_blocks)
+            .finish()
+    }
+}
+
 impl AccessControl {
     pub fn new(cache_ttl_blocks: u32) -> Self {
         Self {
