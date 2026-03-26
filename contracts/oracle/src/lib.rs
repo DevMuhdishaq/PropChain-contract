@@ -24,6 +24,7 @@ mod propchain_oracle {
     pub struct PropertyValuationOracle {
         /// Admin account
         admin: AccountId,
+        access_control: AccessControl,
 
         /// Property valuations storage
         pub property_valuations: Mapping<u64, PropertyValuation>,
@@ -106,8 +107,30 @@ mod propchain_oracle {
         /// Constructor for the Property Valuation Oracle
         #[ink(constructor)]
         pub fn new(admin: AccountId) -> Self {
+            let mut access_control = AccessControl::new(64);
+            let now = ink::env::block_timestamp::<ink::env::DefaultEnvironment>();
+            let block_number = ink::env::block_number::<ink::env::DefaultEnvironment>();
+            access_control.bootstrap(admin, block_number, now);
+            let _ = access_control.grant_role(
+                admin,
+                admin,
+                Role::OracleAdmin,
+                block_number,
+                now,
+            );
+            let _ = access_control.grant_permission_to_role(
+                admin,
+                Role::Admin,
+                Permission {
+                    resource: Resource::Oracle,
+                    action: Action::Configure,
+                },
+                block_number,
+                now,
+            );
             Self {
                 admin,
+                access_control,
                 property_valuations: Mapping::default(),
                 historical_valuations: Mapping::default(),
                 oracle_sources: Mapping::default(),
@@ -464,8 +487,17 @@ mod propchain_oracle {
 
         // Helper methods
 
-        fn ensure_admin(&self) -> Result<(), OracleError> {
-            if self.env().caller() != self.admin {
+        fn ensure_admin(&mut self) -> Result<(), OracleError> {
+            let caller = self.env().caller();
+            let allowed = self.access_control.has_permission_cached(
+                caller,
+                Permission {
+                    resource: Resource::Oracle,
+                    action: Action::Configure,
+                },
+                self.env().block_number(),
+            ) || self.access_control.has_role(caller, Role::OracleAdmin);
+            if !allowed {
                 return Err(OracleError::Unauthorized);
             }
             Ok(())

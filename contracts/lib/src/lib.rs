@@ -94,6 +94,8 @@ mod propchain_contracts {
         fee_manager: Option<AccountId>,
         /// Fractional properties info
         fractional: Mapping<u64, FractionalInfo>,
+        /// Centralized RBAC and permission audit state
+        access_control: AccessControl,
     }
 
     /// Escrow information
@@ -794,6 +796,13 @@ mod propchain_contracts {
                 oracle: None,
                 fee_manager: None,
                 fractional: Mapping::default(),
+                access_control: {
+                    let mut ac = AccessControl::new(64);
+                    ac.bootstrap(caller, block_number, timestamp);
+                    let _ = ac.grant_role(caller, caller, Role::Verifier, block_number, timestamp);
+                    let _ = ac.grant_role(caller, caller, Role::PauseGuardian, block_number, timestamp);
+                    ac
+                },
             };
 
             // Emit contract initialization event
@@ -822,8 +831,7 @@ mod propchain_contracts {
         /// Set the oracle contract address
         #[ink(message)]
         pub fn set_oracle(&mut self, oracle: AccountId) -> Result<(), Error> {
-            let caller = self.env().caller();
-            if caller != self.admin {
+            if !self.ensure_admin_rbac() {
                 return Err(Error::Unauthorized);
             }
             self.oracle = Some(oracle);
@@ -839,8 +847,7 @@ mod propchain_contracts {
         /// Set the fee manager contract address (admin only)
         #[ink(message)]
         pub fn set_fee_manager(&mut self, fee_manager: Option<AccountId>) -> Result<(), Error> {
-            let caller = self.env().caller();
-            if caller != self.admin {
+            if !self.ensure_admin_rbac() {
                 return Err(Error::Unauthorized);
             }
             self.fee_manager = fee_manager;
@@ -895,12 +902,19 @@ mod propchain_contracts {
         #[ink(message)]
         pub fn change_admin(&mut self, new_admin: AccountId) -> Result<(), Error> {
             let caller = self.env().caller();
-            if caller != self.admin {
+            if !self.ensure_admin_rbac() {
                 return Err(Error::Unauthorized);
             }
 
             let old_admin = self.admin;
             self.admin = new_admin;
+            let _ = self.access_control.grant_role(
+                caller,
+                new_admin,
+                Role::Admin,
+                self.env().block_number(),
+                self.env().block_timestamp(),
+            );
 
             // Emit enhanced admin changed event
 
@@ -924,8 +938,7 @@ mod propchain_contracts {
             &mut self,
             registry: Option<AccountId>,
         ) -> Result<(), Error> {
-            let caller = self.env().caller();
-            if caller != self.admin {
+            if !self.ensure_admin_rbac() {
                 return Err(Error::Unauthorized);
             }
             self.compliance_registry = registry;
@@ -1004,7 +1017,7 @@ mod propchain_contracts {
             duration_seconds: Option<u64>,
         ) -> Result<(), Error> {
             let caller = self.env().caller();
-            let is_admin = caller == self.admin;
+            let is_admin = self.access_control.has_role(caller, Role::Admin);
             let is_guardian = self.pause_guardians.get(caller).unwrap_or(false);
 
             if !is_admin && !is_guardian {
@@ -1071,7 +1084,7 @@ mod propchain_contracts {
         pub fn request_resume(&mut self) -> Result<(), Error> {
             let caller = self.env().caller();
             // Only admin or guardians can request resume
-            let is_admin = caller == self.admin;
+            let is_admin = self.access_control.has_role(caller, Role::Admin);
             let is_guardian = self.pause_guardians.get(caller).unwrap_or(false);
 
             if !is_admin && !is_guardian {
@@ -1109,7 +1122,7 @@ mod propchain_contracts {
         #[ink(message)]
         pub fn approve_resume(&mut self) -> Result<(), Error> {
             let caller = self.env().caller();
-            let is_admin = caller == self.admin;
+            let is_admin = self.access_control.has_role(caller, Role::Admin);
             let is_guardian = self.pause_guardians.get(caller).unwrap_or(false);
 
             if !is_admin && !is_guardian {
@@ -1161,7 +1174,7 @@ mod propchain_contracts {
             guardian: AccountId,
             is_enabled: bool,
         ) -> Result<(), Error> {
-            if self.env().caller() != self.admin {
+            if !self.ensure_admin_rbac() {
                 return Err(Error::Unauthorized);
             }
             self.pause_guardians.insert(guardian, &is_enabled);
@@ -1178,6 +1191,44 @@ mod propchain_contracts {
         #[ink(message)]
         pub fn get_pause_state(&self) -> PauseInfo {
             self.pause_info.clone()
+        }
+
+        #[ink(message)]
+        pub fn grant_role(&mut self, account: AccountId, role: Role) -> Result<(), Error> {
+            let caller = self.env().caller();
+            self.access_control
+                .grant_role(
+                    caller,
+                    account,
+                    role,
+                    self.env().block_number(),
+                    self.env().block_timestamp(),
+                )
+                .map_err(|_| Error::Unauthorized)
+        }
+
+        #[ink(message)]
+        pub fn revoke_role(&mut self, account: AccountId, role: Role) -> Result<(), Error> {
+            let caller = self.env().caller();
+            self.access_control
+                .revoke_role(
+                    caller,
+                    account,
+                    role,
+                    self.env().block_number(),
+                    self.env().block_timestamp(),
+                )
+                .map_err(|_| Error::Unauthorized)
+        }
+
+        #[ink(message)]
+        pub fn has_role(&self, account: AccountId, role: Role) -> bool {
+            self.access_control.has_role(account, role)
+        }
+
+        #[ink(message)]
+        pub fn get_permission_audit_entry(&self, id: u64) -> Option<PermissionAuditEntry> {
+            self.access_control.get_audit_entry(id)
         }
 
         /// Registers a new property
@@ -2070,7 +2121,7 @@ mod propchain_contracts {
         #[ink(message)]
         pub fn set_verifier(&mut self, verifier: AccountId, authorized: bool) -> Result<(), Error> {
             let caller = self.env().caller();
-            if caller != self.admin {
+            if !self.ensure_admin_rbac() {
                 return Err(Error::Unauthorized);
             }
 
@@ -2387,7 +2438,7 @@ mod propchain_contracts {
             self.ensure_not_paused()?;
             let caller = self.env().caller();
 
-            if caller != self.admin {
+            if !self.ensure_admin_rbac() {
                 return Err(Error::Unauthorized);
             }
 
@@ -2574,6 +2625,18 @@ mod propchain_contracts {
                 .get(property_id)
                 .map(|i: FractionalInfo| i.enabled)
                 .unwrap_or(false)
+        }
+
+        fn ensure_admin_rbac(&mut self) -> bool {
+            let caller = self.env().caller();
+            self.access_control.has_permission_cached(
+                caller,
+                Permission {
+                    resource: Resource::PropertyRegistry,
+                    action: Action::Configure,
+                },
+                self.env().block_number(),
+            ) || self.access_control.has_role(caller, Role::Admin)
         }
     }
 }

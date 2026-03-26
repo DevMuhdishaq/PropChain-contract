@@ -1,0 +1,322 @@
+use ink::prelude::vec::Vec;
+use ink::primitives::AccountId;
+use ink::storage::Mapping;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout))]
+pub enum Role {
+    SuperAdmin,
+    Admin,
+    OracleAdmin,
+    ComplianceAdmin,
+    FeeAdmin,
+    BridgeOperator,
+    Verifier,
+    PauseGuardian,
+    Manager,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout))]
+pub enum Resource {
+    Global,
+    PropertyRegistry,
+    Oracle,
+    Bridge,
+    Escrow,
+    Compliance,
+    Metadata,
+    Insurance,
+    Analytics,
+    Fees,
+    Property(u64),
+    Token(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout))]
+pub enum Action {
+    ManageRoles,
+    Configure,
+    Update,
+    Transfer,
+    Pause,
+    Verify,
+    Mint,
+    Burn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout))]
+pub struct Permission {
+    pub resource: Resource,
+    pub action: Action,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout))]
+pub enum AuditAction {
+    RoleGranted,
+    RoleRevoked,
+    PermissionGrantedToRole,
+    PermissionRevokedFromRole,
+    PermissionGrantedToAccount,
+    PermissionRevokedFromAccount,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout))]
+pub struct PermissionAuditEntry {
+    pub id: u64,
+    pub actor: AccountId,
+    pub target: AccountId,
+    pub action: AuditAction,
+    pub role: Option<Role>,
+    pub permission: Option<Permission>,
+    pub block_number: u32,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum AccessControlError {
+    Unauthorized,
+}
+
+#[ink::storage_item]
+#[derive(Default)]
+pub struct AccessControl {
+    role_assignments: Mapping<(AccountId, Role), bool>,
+    role_permissions: Mapping<(Role, Permission), bool>,
+    account_permissions: Mapping<(AccountId, Permission), bool>,
+    permission_cache: Mapping<(AccountId, Permission, u64), bool>,
+    audit_log: Mapping<u64, PermissionAuditEntry>,
+    audit_count: u64,
+    cache_epoch: u64,
+    cache_ttl_blocks: u32,
+}
+
+impl AccessControl {
+    pub fn new(cache_ttl_blocks: u32) -> Self {
+        Self {
+            role_assignments: Mapping::default(),
+            role_permissions: Mapping::default(),
+            account_permissions: Mapping::default(),
+            permission_cache: Mapping::default(),
+            audit_log: Mapping::default(),
+            audit_count: 0,
+            cache_epoch: 0,
+            cache_ttl_blocks,
+        }
+    }
+
+    pub fn bootstrap(&mut self, admin: AccountId, block_number: u32, timestamp: u64) {
+        self.role_assignments
+            .insert((admin, Role::SuperAdmin), &true);
+        self.role_assignments.insert((admin, Role::Admin), &true);
+        self.write_audit(
+            admin,
+            admin,
+            AuditAction::RoleGranted,
+            Some(Role::SuperAdmin),
+            None,
+            block_number,
+            timestamp,
+        );
+        self.write_audit(
+            admin,
+            admin,
+            AuditAction::RoleGranted,
+            Some(Role::Admin),
+            None,
+            block_number,
+            timestamp,
+        );
+    }
+
+    pub fn grant_role(
+        &mut self,
+        actor: AccountId,
+        target: AccountId,
+        role: Role,
+        block_number: u32,
+        timestamp: u64,
+    ) -> Result<(), AccessControlError> {
+        self.ensure_has_role(actor, Role::Admin)?;
+        self.role_assignments.insert((target, role), &true);
+        self.invalidate_cache();
+        self.write_audit(
+            actor,
+            target,
+            AuditAction::RoleGranted,
+            Some(role),
+            None,
+            block_number,
+            timestamp,
+        );
+        Ok(())
+    }
+
+    pub fn revoke_role(
+        &mut self,
+        actor: AccountId,
+        target: AccountId,
+        role: Role,
+        block_number: u32,
+        timestamp: u64,
+    ) -> Result<(), AccessControlError> {
+        self.ensure_has_role(actor, Role::Admin)?;
+        self.role_assignments.remove((target, role));
+        self.invalidate_cache();
+        self.write_audit(
+            actor,
+            target,
+            AuditAction::RoleRevoked,
+            Some(role),
+            None,
+            block_number,
+            timestamp,
+        );
+        Ok(())
+    }
+
+    pub fn grant_permission_to_role(
+        &mut self,
+        actor: AccountId,
+        role: Role,
+        permission: Permission,
+        block_number: u32,
+        timestamp: u64,
+    ) -> Result<(), AccessControlError> {
+        self.ensure_has_role(actor, Role::Admin)?;
+        self.role_permissions.insert((role, permission), &true);
+        self.invalidate_cache();
+        self.write_audit(
+            actor,
+            actor,
+            AuditAction::PermissionGrantedToRole,
+            Some(role),
+            Some(permission),
+            block_number,
+            timestamp,
+        );
+        Ok(())
+    }
+
+    pub fn has_role(&self, account: AccountId, role: Role) -> bool {
+        self.role_assignments.get((account, role)).unwrap_or(false)
+            || self
+                .ancestor_roles(role)
+                .iter()
+                .any(|ancestor| self.role_assignments.get((account, *ancestor)).unwrap_or(false))
+    }
+
+    pub fn ensure_has_role(&self, account: AccountId, role: Role) -> Result<(), AccessControlError> {
+        if self.has_role(account, role) {
+            Ok(())
+        } else {
+            Err(AccessControlError::Unauthorized)
+        }
+    }
+
+    pub fn has_permission_cached(
+        &mut self,
+        account: AccountId,
+        permission: Permission,
+        current_block: u32,
+    ) -> bool {
+        if let Some(cached) = self
+            .permission_cache
+            .get((account, permission, self.cache_epoch))
+        {
+            return cached;
+        }
+        let value = self.has_permission(account, permission);
+        self.permission_cache
+            .insert((account, permission, self.cache_epoch), &value);
+        let _ = current_block.saturating_add(self.cache_ttl_blocks);
+        value
+    }
+
+    pub fn has_permission(&self, account: AccountId, permission: Permission) -> bool {
+        if self
+            .account_permissions
+            .get((account, permission))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        self.all_roles()
+            .iter()
+            .filter(|role| self.has_role(account, **role))
+            .any(|role| {
+                self.role_permissions
+                    .get((*role, permission))
+                    .unwrap_or(false)
+            })
+    }
+
+    pub fn get_audit_entry(&self, id: u64) -> Option<PermissionAuditEntry> {
+        self.audit_log.get(id)
+    }
+
+    pub fn audit_count(&self) -> u64 {
+        self.audit_count
+    }
+
+    fn invalidate_cache(&mut self) {
+        self.cache_epoch = self.cache_epoch.saturating_add(1);
+    }
+
+    fn ancestor_roles(&self, role: Role) -> Vec<Role> {
+        match role {
+            Role::SuperAdmin => Vec::new(),
+            Role::Admin => vec![Role::SuperAdmin],
+            Role::OracleAdmin => vec![Role::Admin, Role::SuperAdmin],
+            Role::ComplianceAdmin => vec![Role::Admin, Role::SuperAdmin],
+            Role::FeeAdmin => vec![Role::Admin, Role::SuperAdmin],
+            Role::BridgeOperator => vec![Role::Admin, Role::SuperAdmin],
+            Role::Verifier => vec![Role::Admin, Role::SuperAdmin],
+            Role::PauseGuardian => vec![Role::Admin, Role::SuperAdmin],
+            Role::Manager => vec![Role::Admin, Role::SuperAdmin],
+        }
+    }
+
+    fn all_roles(&self) -> [Role; 9] {
+        [
+            Role::SuperAdmin,
+            Role::Admin,
+            Role::OracleAdmin,
+            Role::ComplianceAdmin,
+            Role::FeeAdmin,
+            Role::BridgeOperator,
+            Role::Verifier,
+            Role::PauseGuardian,
+            Role::Manager,
+        ]
+    }
+
+    fn write_audit(
+        &mut self,
+        actor: AccountId,
+        target: AccountId,
+        action: AuditAction,
+        role: Option<Role>,
+        permission: Option<Permission>,
+        block_number: u32,
+        timestamp: u64,
+    ) {
+        self.audit_count = self.audit_count.saturating_add(1);
+        let entry = PermissionAuditEntry {
+            id: self.audit_count,
+            actor,
+            target,
+            action,
+            role,
+            permission,
+            block_number,
+            timestamp,
+        };
+        self.audit_log.insert(self.audit_count, &entry);
+    }
+}
