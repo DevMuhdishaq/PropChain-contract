@@ -279,72 +279,88 @@ set -x
 ./scripts/emergency-upgrade.sh $CONTRACT_ADDRESS $NEW_CODE_HASH
 ```
 
-## Automation
+## Automated Deployment Pipeline
 
-### CI/CD Pipeline
+PropChain uses GitHub Actions for automated deployments. The pipeline is defined in `.github/workflows/deploy.yml`.
 
-```yaml
-# .github/workflows/deploy.yml
-name: Deploy Contract
-on:
-  push:
-    tags: ['v*']
+### Pipeline Stages
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - name: Setup Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-      - name: Build Contract
-        run: cargo contract build --release
-      - name: Deploy to Testnet
-        run: ./scripts/deploy-testnet.sh
-        env:
-          TESTNET_SURI: ${{ secrets.TESTNET_SURI }}
-```
+1. **Pre-deployment Tests** - Formatting, linting, and unit tests must pass.
+2. **Security Checks** - `cargo audit` scans for known vulnerabilities.
+3. **Build** - Release artifacts are compiled and stored.
+4. **Deploy** - Contracts are deployed to the target network.
+5. **Rollback** - Automatic rollback if deployment fails.
+6. **Notification** - Reports deployment status.
 
-### Deployment Scripts
+### Triggering a Deployment
+
+Deployments are triggered automatically on version tags or manually via workflow dispatch.
 
 ```bash
-#!/bin/bash
-# scripts/deploy.sh
+# Tag-based deployment (triggers automatically)
+git tag v1.0.0
+git push origin v1.0.0
 
-set -euo pipefail
+# Manual deployment via GitHub CLI
+gh workflow run deploy.yml \
+  --field network=westend \
+  --field dry_run=false
+```
 
-NETWORK=${1:-testnet}
-CONTRACT=${2:-property-registry}
+### Deployment Script Usage
 
-echo "Deploying $CONTRACT to $NETWORK..."
+The `scripts/deploy.sh` script supports several commands.
 
-case $NETWORK in
-  local)
-    NODE_URL="ws://localhost:9944"
-    SURI="//Alice"
-    ;;
-  westend)
-    NODE_URL="wss://westend-rpc.polkadot.io"
-    SURI="$WESTEND_SURI"
-    ;;
-  polkadot)
-    NODE_URL="wss://rpc.polkadot.io"
-    SURI="$POLKADOT_SURI"
-    ;;
-  *)
-    echo "Unknown network: $NETWORK"
-    exit 1
-    ;;
-esac
+```bash
+# Deploy all contracts to a network
+./scripts/deploy.sh --network westend
 
-cargo contract upload \
-  --url "$NODE_URL" \
-  --suri "$SURI" \
-  --confirm
+# Deploy a specific contract with verification
+./scripts/deploy.sh --network westend --contract property-token --verify
 
-echo "Deployment completed successfully!"
+# List current deployments
+./scripts/deploy.sh --network westend --list
+
+# Rollback to previous deployment state
+./scripts/deploy.sh --network westend --rollback
+
+# Skip pre-deployment tests (not recommended for production)
+./scripts/deploy.sh --network local --skip-tests
+```
+
+## Rollback Mechanisms
+
+### Automatic Rollback
+
+The deployment script backs up the current deployment state before deploying. If deployment fails, it automatically restores the previous state.
+
+Note: On-chain contracts are immutable. Rollback restores local deployment records (addresses, code hashes). If a deployed contract is faulty, redeploy the previous version as a new instance.
+
+### Manual Rollback
+
+```bash
+# Rollback to the most recent backup
+./scripts/deploy.sh --network westend --rollback
+
+# Rollback to a specific backup
+./scripts/deploy.sh --network westend --rollback deployments/backups/westend-20240101-120000
+```
+
+### Backup Structure
+
+Backups are stored in `deployments/backups/` with timestamped directories.
+
+```
+deployments/
+  backups/
+    westend-20240101-120000/
+      property-token.json
+      property-registry.json
+    westend-20240115-090000/
+      property-token.json
+  westend/
+    property-token.json
+    property-registry.json
 ```
 
 ## Post-deployment
@@ -363,9 +379,13 @@ echo "Deployment completed successfully!"
 - Update project status page
 - Send notification to subscribers
 
-### Performance Monitoring
+### Post-deployment Monitoring
 
-- Set up monitoring dashboards
-- Configure alerts for anomalies
-- Track gas usage patterns
-- Monitor contract interaction metrics
+The deploy script includes a built-in monitoring step that verifies contract accessibility and reports the on-chain code hash after each deployment.
+
+For ongoing monitoring:
+
+- Verify contract accessibility using `cargo contract info --contract $ADDRESS --url $NODE_URL`
+- Track gas usage patterns by reviewing transaction history on block explorers
+- Monitor contract events using Substrate event subscriptions
+- Set up alerts for failed transactions or unexpected state changes

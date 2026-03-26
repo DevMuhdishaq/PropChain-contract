@@ -13,8 +13,6 @@ jobs:
   test:
     name: Test Suite
     runs-on: ubuntu-latest
-    # Disabled to ensure CI passes
-    if: false
     steps:
     - uses: actions/checkout@v4
     
@@ -22,7 +20,7 @@ jobs:
       uses: actions-rs/toolchain@v1
       with:
         profile: minimal
-        toolchain: ${{ matrix.rust }}
+        toolchain: stable
         override: true
         components: rustfmt, clippy
     

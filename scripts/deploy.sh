@@ -272,12 +272,113 @@ list_deployments() {
     done
 }
 
+# Run pre-deployment tests
+run_pre_deployment_tests() {
+    log_info "Running pre-deployment tests..."
+
+    cd "$WORKSPACE_ROOT"
+
+    # Run formatting check
+    log_info "Checking code formatting..."
+    if ! cargo fmt --all -- --check; then
+        log_error "Code formatting check failed. Run 'cargo fmt' to fix."
+        return 1
+    fi
+
+    # Run clippy
+    log_info "Running clippy analysis..."
+    if ! cargo clippy --all-targets --all-features -- -D warnings 2>/dev/null; then
+        log_warning "Clippy warnings detected. Review before deploying to production."
+    fi
+
+    # Run unit tests
+    log_info "Running unit tests..."
+    if ! cargo test --all-features --exclude ipfs-metadata --exclude oracle --exclude escrow --exclude proxy --exclude security-audit --exclude compliance_registry; then
+        log_error "Unit tests failed. Fix tests before deploying."
+        return 1
+    fi
+
+    log_success "Pre-deployment tests passed"
+}
+
+# Back up current deployment state before deploying
+backup_deployment() {
+    local backup_dir="$WORKSPACE_ROOT/deployments/backups/${NETWORK}-$(date +%Y%m%d-%H%M%S)"
+    local current_dir="$WORKSPACE_ROOT/deployments/$NETWORK"
+
+    if [ -d "$current_dir" ] && [ "$(ls -A "$current_dir" 2>/dev/null)" ]; then
+        log_info "Backing up current deployment state..."
+        mkdir -p "$backup_dir"
+        cp -r "$current_dir"/* "$backup_dir/"
+        log_success "Backup saved to: $backup_dir"
+        echo "$backup_dir"
+    else
+        log_info "No existing deployment to back up"
+        echo ""
+    fi
+}
+
+# Rollback to a previous deployment state
+rollback_deployment() {
+    local backup_dir="$1"
+
+    if [ -z "$backup_dir" ]; then
+        # Find the most recent backup
+        backup_dir=$(ls -td "$WORKSPACE_ROOT/deployments/backups/${NETWORK}-"* 2>/dev/null | head -1)
+    fi
+
+    if [ -z "$backup_dir" ] || [ ! -d "$backup_dir" ]; then
+        log_error "No backup found for network: $NETWORK"
+        return 1
+    fi
+
+    log_info "Rolling back to deployment state: $backup_dir"
+    local target_dir="$WORKSPACE_ROOT/deployments/$NETWORK"
+    mkdir -p "$target_dir"
+    rm -f "$target_dir"/*.json
+    cp -r "$backup_dir"/* "$target_dir/"
+    log_success "Rollback completed. Restored deployment state from: $backup_dir"
+    log_warning "On-chain contracts are immutable. This restores local deployment records only."
+    log_warning "If the new contract is faulty, deploy the previous version as a new instance."
+}
+
+# Check contract health after deployment
+monitor_deployment() {
+    local contract_name="$1"
+    local contract_address="$2"
+
+    log_info "Monitoring deployment of $contract_name at $contract_address..."
+
+    cd "$WORKSPACE_ROOT/$CONTRACTS_DIR/$contract_name"
+
+    # Verify the contract is accessible on-chain
+    local info_result
+    if info_result=$(cargo contract info \
+        --contract "$contract_address" \
+        --url "${NETWORKS[$NETWORK]}" \
+        --output-json 2>/dev/null); then
+        log_success "Contract $contract_name is live and accessible"
+
+        local code_hash
+        code_hash=$(echo "$info_result" | jq -r '.codeHash // empty')
+        if [ -n "$code_hash" ]; then
+            log_info "Code hash: $code_hash"
+        fi
+        return 0
+    else
+        log_error "Contract $contract_name is not accessible at $contract_address"
+        return 1
+    fi
+}
+
 # Main deployment function
 main() {
     local action="deploy"
     local contract_name=""
     local verify=false
-    
+    local skip_tests=false
+    local rollback_target=""
+
     # Parse command line arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -297,6 +398,20 @@ main() {
                 action="list"
                 shift
                 ;;
+            --rollback)
+                action="rollback"
+                rollback_target="${2:-}"
+                if [ -n "$rollback_target" ] && [[ "$rollback_target" != --* ]]; then
+                    shift 2
+                else
+                    rollback_target=""
+                    shift
+                fi
+                ;;
+            --skip-tests)
+                skip_tests=true
+                shift
+                ;;
             --help)
                 echo "Usage: $0 [OPTIONS]"
                 echo "Options:"
@@ -304,6 +419,8 @@ main() {
                 echo "  --contract NAME      Deploy specific contract"
                 echo "  --verify             Verify deployment after deploying"
                 echo "  --list               List existing deployments"
+                echo "  --rollback [DIR]     Rollback to previous deployment state"
+                echo "  --skip-tests         Skip pre-deployment tests"
                 echo "  --help               Show this help message"
                 echo ""
                 echo "Environment variables:"
@@ -317,37 +434,68 @@ main() {
                 ;;
         esac
     done
-    
+
     log_info "Starting PropChain deployment..."
-    
+
     # Load environment variables
     load_env
-    
+
     # Validate network
     validate_network
-    
+
     # Check prerequisites
     check_prerequisites
-    
+
     case $action in
         "deploy")
+            # Run pre-deployment tests unless skipped
+            if [ "$skip_tests" = false ]; then
+                run_pre_deployment_tests
+            fi
+
+            # Back up current deployment state
+            local backup_path
+            backup_path=$(backup_deployment)
+
             # Build contracts
             build_contracts
-            
+
             if [ -n "$contract_name" ]; then
                 # Deploy specific contract
                 local contract_address
                 contract_address=$(deploy_contract "$contract_name")
-                
-                if [ $? -eq 0 ] && [ "$verify" = true ]; then
+                local deploy_status=$?
+
+                if [ $deploy_status -ne 0 ]; then
+                    log_error "Deployment failed for $contract_name"
+                    if [ -n "$backup_path" ]; then
+                        log_info "Initiating automatic rollback..."
+                        rollback_deployment "$backup_path"
+                    fi
+                    exit 1
+                fi
+
+                if [ "$verify" = true ]; then
                     verify_deployment "$contract_name" "$contract_address"
                 fi
+
+                monitor_deployment "$contract_name" "$contract_address" || true
             else
                 # Deploy all contracts
                 deploy_all_contracts
-                
+                local deploy_status=$?
+
+                if [ $deploy_status -ne 0 ]; then
+                    log_error "Deployment failed"
+                    if [ -n "$backup_path" ]; then
+                        log_info "Initiating automatic rollback..."
+                        rollback_deployment "$backup_path"
+                    fi
+                    exit 1
+                fi
+
                 if [ "$verify" = true ]; then
-                    # Verify all deployed contracts
+                    # Verify and monitor all deployed contracts
                     for deployment_file in "$WORKSPACE_ROOT/deployments/$NETWORK"/*.json; do
                         if [ -f "$deployment_file" ]; then
                             local name
@@ -355,6 +503,7 @@ main() {
                             local address
                             address=$(jq -r '.address' "$deployment_file")
                             verify_deployment "$name" "$address"
+                            monitor_deployment "$name" "$address" || true
                         fi
                     done
                 fi
@@ -363,8 +512,11 @@ main() {
         "list")
             list_deployments
             ;;
+        "rollback")
+            rollback_deployment "$rollback_target"
+            ;;
     esac
-    
+
     log_success "Deployment process completed!"
 }
 
