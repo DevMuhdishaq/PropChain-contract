@@ -349,7 +349,7 @@ mod tests {
     // ============================================================================
 
     #[ink::test]
-    fn test_register_property_with_max_size() {
+    fn test_register_property_with_max_size_rejected() {
         let accounts = default_accounts();
         set_caller(accounts.alice);
 
@@ -362,17 +362,15 @@ mod tests {
             "https://ipfs.io/max",
         );
 
-        let property_id = contract
-            .register_property(metadata.clone())
-            .expect("Failed to register property with max size");
-
-        let property = contract.get_property(property_id).unwrap();
-        assert_eq!(property.metadata.size, u64::MAX);
-        assert_eq!(property.metadata.valuation, u128::MAX);
+        // Size exceeds MAX_PROPERTY_SIZE, should be rejected
+        assert_eq!(
+            contract.register_property(metadata),
+            Err(Error::ValueOutOfBounds)
+        );
     }
 
     #[ink::test]
-    fn test_register_property_with_zero_values() {
+    fn test_register_property_with_zero_values_rejected() {
         let accounts = default_accounts();
         set_caller(accounts.alice);
 
@@ -385,31 +383,26 @@ mod tests {
             "https://ipfs.io/zero",
         );
 
-        let property_id = contract
-            .register_property(metadata.clone())
-            .expect("Failed to register property with zero values");
-
-        let property = contract.get_property(property_id).unwrap();
-        assert_eq!(property.metadata.size, 0);
-        assert_eq!(property.metadata.valuation, 0);
+        // Size and valuation below minimums, should be rejected
+        assert_eq!(
+            contract.register_property(metadata),
+            Err(Error::ValueOutOfBounds)
+        );
     }
 
     #[ink::test]
-    fn test_register_property_with_empty_strings() {
+    fn test_register_property_with_empty_strings_rejected() {
         let accounts = default_accounts();
         set_caller(accounts.alice);
 
         let mut contract = PropertyRegistry::new();
         let metadata = create_custom_metadata("", 1000, "", 1000000, "");
 
-        let property_id = contract
-            .register_property(metadata.clone())
-            .expect("Failed to register property with empty strings");
-
-        let property = contract.get_property(property_id).unwrap();
-        assert_eq!(property.metadata.location, "");
-        assert_eq!(property.metadata.legal_description, "");
-        assert_eq!(property.metadata.documents_url, "");
+        // Empty location and legal_description should be rejected
+        assert_eq!(
+            contract.register_property(metadata),
+            Err(Error::InvalidMetadata)
+        );
     }
 
     #[ink::test]
@@ -435,7 +428,7 @@ mod tests {
     }
 
     #[ink::test]
-    fn test_transfer_property_to_self() {
+    fn test_transfer_property_to_self_rejected() {
         let accounts = default_accounts();
         set_caller(accounts.alice);
 
@@ -444,19 +437,16 @@ mod tests {
             .register_property(create_sample_metadata())
             .expect("Failed to register property");
 
-        // Transfer to self
+        // Transfer to self should be rejected
         set_caller(accounts.alice);
-        assert!(contract
-            .transfer_property(property_id, accounts.alice)
-            .is_ok());
+        assert_eq!(
+            contract.transfer_property(property_id, accounts.alice),
+            Err(Error::SelfTransferNotAllowed)
+        );
 
         // Property should still be owned by alice
         let property = contract.get_property(property_id).unwrap();
         assert_eq!(property.owner, accounts.alice);
-
-        // Alice should still have the property in her list
-        let alice_properties = contract.get_owner_properties(accounts.alice);
-        assert!(alice_properties.contains(&property_id));
     }
 
     #[ink::test]
@@ -1452,17 +1442,17 @@ mod tests {
             .expect("Failed to batch register");
 
         // Get properties in medium price range
-        let medium_properties = contract.get_properties_by_price_range(100000, 200000);
+        let medium_properties = contract.get_properties_by_price_range(100000, 200000).unwrap();
         assert_eq!(medium_properties.len(), 1);
         assert_eq!(medium_properties[0], 2); // Medium Property
 
         // Get properties in high price range
-        let high_properties = contract.get_properties_by_price_range(200000, 300000);
+        let high_properties = contract.get_properties_by_price_range(200000, 300000).unwrap();
         assert_eq!(high_properties.len(), 1);
         assert_eq!(high_properties[0], 3); // Expensive Property
 
         // Get all properties
-        let all_properties = contract.get_properties_by_price_range(0, 300000);
+        let all_properties = contract.get_properties_by_price_range(0, 300000).unwrap();
         assert_eq!(all_properties.len(), 3);
         assert!(all_properties.contains(&1));
         assert!(all_properties.contains(&2));
@@ -1505,17 +1495,17 @@ mod tests {
             .expect("Failed to batch register");
 
         // Get properties in medium size range
-        let medium_properties = contract.get_properties_by_size_range(1000, 2000);
+        let medium_properties = contract.get_properties_by_size_range(1000, 2000).unwrap();
         assert_eq!(medium_properties.len(), 1);
         assert_eq!(medium_properties[0], 2); // Medium Property
 
         // Get properties in large size range
-        let large_properties = contract.get_properties_by_size_range(2000, 3000);
+        let large_properties = contract.get_properties_by_size_range(2000, 3000).unwrap();
         assert_eq!(large_properties.len(), 1);
         assert_eq!(large_properties[0], 3); // Large Property
 
         // Get all properties
-        let all_properties = contract.get_properties_by_size_range(0, 3000);
+        let all_properties = contract.get_properties_by_size_range(0, 3000).unwrap();
         assert_eq!(all_properties.len(), 3);
         assert!(all_properties.contains(&1));
         assert!(all_properties.contains(&2));
@@ -1660,34 +1650,38 @@ mod tests {
     }
 
     #[ink::test]
-    fn batch_operations_with_empty_input_works() {
+    fn batch_operations_with_empty_input_rejected() {
         let accounts = default_accounts();
         set_caller(accounts.alice);
         let mut contract = PropertyRegistry::new();
 
-        // Test empty batch register
+        // Empty batch register should be rejected
         let empty_properties: Vec<PropertyMetadata> = vec![];
-        let result = contract.batch_register_properties(empty_properties);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().successes.len(), 0);
+        assert_eq!(
+            contract.batch_register_properties(empty_properties),
+            Err(Error::ValueOutOfBounds)
+        );
 
-        // Test empty batch transfer
+        // Empty batch transfer should be rejected
         let empty_transfers: Vec<u64> = vec![];
-        assert!(contract
-            .batch_transfer_properties(empty_transfers, accounts.bob)
-            .is_ok());
+        assert_eq!(
+            contract.batch_transfer_properties(empty_transfers, accounts.bob),
+            Err(Error::ValueOutOfBounds)
+        );
 
-        // Test empty batch update
+        // Empty batch update should be rejected
         let empty_updates: Vec<(u64, PropertyMetadata)> = vec![];
-        let result = contract.batch_update_metadata(empty_updates).unwrap();
-        assert!(result.successes.is_empty());
-        assert!(result.failures.is_empty());
+        assert_eq!(
+            contract.batch_update_metadata(empty_updates),
+            Err(Error::ValueOutOfBounds)
+        );
 
-        // Test empty batch transfer to multiple
+        // Empty batch transfer to multiple should be rejected
         let empty_multiple_transfers: Vec<(u64, AccountId)> = vec![];
-        assert!(contract
-            .batch_transfer_properties_to_multiple(empty_multiple_transfers)
-            .is_ok());
+        assert_eq!(
+            contract.batch_transfer_properties_to_multiple(empty_multiple_transfers),
+            Err(Error::ValueOutOfBounds)
+        );
     }
 
     // ============================================================================
@@ -1930,6 +1924,27 @@ mod tests {
         );
     }
 
+    // ============================================================================
+    // INPUT VALIDATION TESTS (Issue #79)
+    // ============================================================================
+
+    // -- Zero Address Tests --
+
+    #[ink::test]
+    fn test_transfer_to_zero_address_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        let property_id = contract
+            .register_property(create_sample_metadata())
+            .expect("register");
+        let zero = AccountId::from([0u8; 32]);
+        assert_eq!(
+            contract.transfer_property(property_id, zero),
+            Err(Error::ZeroAddress)
+        );
+    }
+
     #[ink::test]
     fn update_batch_config_invalid_params_fails() {
         let accounts = default_accounts();
@@ -1960,6 +1975,233 @@ mod tests {
             Err(Error::InvalidMetadata)
         );
     }
+
+    #[ink::test]
+    fn test_change_admin_zero_address_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        let zero = AccountId::from([0u8; 32]);
+        assert_eq!(contract.change_admin(zero), Err(Error::ZeroAddress));
+    }
+
+    #[ink::test]
+    fn test_create_escrow_zero_buyer_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        let property_id = contract
+            .register_property(create_sample_metadata())
+            .expect("register");
+        let zero = AccountId::from([0u8; 32]);
+        assert_eq!(
+            contract.create_escrow(property_id, zero, 1000),
+            Err(Error::ZeroAddress)
+        );
+    }
+
+    #[ink::test]
+    fn test_set_oracle_zero_address_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        let zero = AccountId::from([0u8; 32]);
+        assert_eq!(contract.set_oracle(zero), Err(Error::ZeroAddress));
+    }
+
+    #[ink::test]
+    fn test_grant_role_zero_address_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        let zero = AccountId::from([0u8; 32]);
+        assert_eq!(
+            contract.grant_role(zero, Role::Verifier),
+            Err(Error::ZeroAddress)
+        );
+    }
+
+    #[ink::test]
+    fn test_set_verifier_zero_address_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        let zero = AccountId::from([0u8; 32]);
+        assert_eq!(
+            contract.set_verifier(zero, true),
+            Err(Error::ZeroAddress)
+        );
+    }
+
+    #[ink::test]
+    fn test_set_pause_guardian_zero_address_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        let zero = AccountId::from([0u8; 32]);
+        assert_eq!(
+            contract.set_pause_guardian(zero, true),
+            Err(Error::ZeroAddress)
+        );
+    }
+
+    #[ink::test]
+    fn test_approve_zero_address_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        let property_id = contract
+            .register_property(create_sample_metadata())
+            .expect("register");
+        let zero = AccountId::from([0u8; 32]);
+        assert_eq!(
+            contract.approve(property_id, Some(zero)),
+            Err(Error::ZeroAddress)
+        );
+    }
+
+    // -- Metadata Validation Tests --
+
+    #[ink::test]
+    fn test_register_location_too_long_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        let long_location = "A".repeat(501);
+        let metadata = create_custom_metadata(&long_location, 100, "Valid desc", 1000, "https://example.com");
+        assert_eq!(
+            contract.register_property(metadata),
+            Err(Error::StringTooLong)
+        );
+    }
+
+    #[ink::test]
+    fn test_register_legal_desc_too_long_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        let long_desc = "A".repeat(5001);
+        let metadata = create_custom_metadata("Valid location", 100, &long_desc, 1000, "https://example.com");
+        assert_eq!(
+            contract.register_property(metadata),
+            Err(Error::StringTooLong)
+        );
+    }
+
+    #[ink::test]
+    fn test_register_size_out_of_bounds_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+
+        // Size = 0 (below minimum)
+        let metadata = create_custom_metadata("Valid", 0, "Valid desc", 1000, "https://example.com");
+        assert_eq!(
+            contract.register_property(metadata),
+            Err(Error::ValueOutOfBounds)
+        );
+
+        // Size above maximum
+        let metadata = create_custom_metadata("Valid", 1_000_000_001, "Valid desc", 1000, "https://example.com");
+        assert_eq!(
+            contract.register_property(metadata),
+            Err(Error::ValueOutOfBounds)
+        );
+    }
+
+    #[ink::test]
+    fn test_register_valuation_below_min_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        let metadata = create_custom_metadata("Valid", 100, "Valid desc", 0, "https://example.com");
+        assert_eq!(
+            contract.register_property(metadata),
+            Err(Error::ValueOutOfBounds)
+        );
+    }
+
+    // -- Batch Size Tests --
+
+    #[ink::test]
+    fn test_batch_register_exceeds_limit_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        let properties: Vec<PropertyMetadata> = (0..51)
+            .map(|i| create_custom_metadata(
+                &format!("Property {}", i), 100, "Valid desc", 1000, "https://example.com"
+            ))
+            .collect();
+        assert_eq!(
+            contract.batch_register_properties(properties),
+            Err(Error::BatchSizeExceeded)
+        );
+    }
+
+    // -- Self-Transfer Tests --
+
+    #[ink::test]
+    fn test_approve_self_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        let property_id = contract
+            .register_property(create_sample_metadata())
+            .expect("register");
+        assert_eq!(
+            contract.approve(property_id, Some(accounts.alice)),
+            Err(Error::SelfTransferNotAllowed)
+        );
+    }
+
+    // -- String Length Tests --
+
+    #[ink::test]
+    fn test_pause_reason_too_long_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        let long_reason = "A".repeat(2001);
+        assert_eq!(
+            contract.pause_contract(long_reason, None),
+            Err(Error::StringTooLong)
+        );
+    }
+
+    #[ink::test]
+    fn test_badge_url_too_long_rejected() {
+        use crate::propchain_contracts::BadgeType;
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        let property_id = contract
+            .register_property(create_sample_metadata())
+            .expect("register");
+        let long_url = "https://".to_string() + &"a".repeat(2050);
+        assert_eq!(
+            contract.issue_badge(property_id, BadgeType::DocumentVerification, None, long_url),
+            Err(Error::StringTooLong)
+        );
+    }
+
+    // -- Numeric Bounds Tests --
+
+    #[ink::test]
+    fn test_create_escrow_zero_amount_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        let property_id = contract
+            .register_property(create_sample_metadata())
+            .expect("register");
+        assert_eq!(
+            contract.create_escrow(property_id, accounts.bob, 0),
+            Err(Error::ValueOutOfBounds)
+        );
+    }
+
+    // -- Batch Config Size Guard Tests (from main) --
 
     #[ink::test]
     fn batch_register_properties_size_guard_works() {
@@ -2177,5 +2419,109 @@ mod tests {
         assert_eq!(stats.total_items_failed, 1);
         assert_eq!(stats.total_early_terminations, 0);
         assert_eq!(stats.largest_batch_processed, 3);
+    }
+
+    // -- Issue #79 Numeric/Range/Transfer validation tests --
+
+    #[ink::test]
+    fn test_issue_badge_past_expiry_rejected() {
+        use crate::propchain_contracts::BadgeType;
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        ink::env::test::set_block_timestamp::<ink::env::DefaultEnvironment>(1000);
+        let mut contract = PropertyRegistry::new();
+        let property_id = contract
+            .register_property(create_sample_metadata())
+            .expect("register");
+        // expires_at in the past
+        assert_eq!(
+            contract.issue_badge(
+                property_id,
+                BadgeType::DocumentVerification,
+                Some(500),
+                "https://metadata.example.com/badge.json".to_string()
+            ),
+            Err(Error::ValueOutOfBounds)
+        );
+    }
+
+    #[ink::test]
+    fn test_pause_duration_too_long_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        // Duration exceeds MAX_PAUSE_DURATION (30 days = 2_592_000 seconds)
+        assert_eq!(
+            contract.pause_contract("Maintenance".to_string(), Some(3_000_000)),
+            Err(Error::ValueOutOfBounds)
+        );
+    }
+
+    #[ink::test]
+    fn test_pause_duration_too_short_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        // Duration below MIN_PAUSE_DURATION (60 seconds)
+        assert_eq!(
+            contract.pause_contract("Maintenance".to_string(), Some(10)),
+            Err(Error::ValueOutOfBounds)
+        );
+    }
+
+    // -- Range Query Tests --
+
+    #[ink::test]
+    fn test_price_range_invalid_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let contract = PropertyRegistry::new();
+        assert_eq!(
+            contract.get_properties_by_price_range(200000, 100000),
+            Err(Error::InvalidRange)
+        );
+    }
+
+    #[ink::test]
+    fn test_size_range_invalid_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let contract = PropertyRegistry::new();
+        assert_eq!(
+            contract.get_properties_by_size_range(2000, 1000),
+            Err(Error::InvalidRange)
+        );
+    }
+
+    // -- Batch Transfer Zero Address Tests --
+
+    #[ink::test]
+    fn test_batch_transfer_to_zero_address_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        let property_id = contract
+            .register_property(create_sample_metadata())
+            .expect("register");
+        let zero = AccountId::from([0u8; 32]);
+        assert_eq!(
+            contract.batch_transfer_properties(vec![property_id], zero),
+            Err(Error::ZeroAddress)
+        );
+    }
+
+    #[ink::test]
+    fn test_batch_transfer_to_multiple_zero_address_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = PropertyRegistry::new();
+        let property_id = contract
+            .register_property(create_sample_metadata())
+            .expect("register");
+        let zero = AccountId::from([0u8; 32]);
+        assert_eq!(
+            contract.batch_transfer_properties_to_multiple(vec![(property_id, zero)]),
+            Err(Error::ZeroAddress)
+        );
     }
 }
