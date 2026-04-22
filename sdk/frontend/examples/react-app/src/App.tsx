@@ -3,13 +3,15 @@ import { ConnectWallet } from './components/ConnectWallet';
 import { PropertyRegistry } from './components/PropertyRegistry';
 import { EscrowManager } from './components/EscrowManager';
 import { PropertyTokens } from './components/PropertyTokens';
+import { LoadTestingDashboard } from './components/LoadTestingDashboard';
 
-type TabId = 'properties' | 'escrow' | 'tokens';
+type TabId = 'properties' | 'escrow' | 'tokens' | 'loadtesting';
 
 const TABS: { id: TabId; label: string; icon: string }[] = [
   { id: 'properties', label: 'Properties', icon: '🏠' },
   { id: 'escrow', label: 'Escrow', icon: '🔐' },
   { id: 'tokens', label: 'Tokens', icon: '🪙' },
+  { id: 'loadtesting', label: 'Load Tests', icon: '📊' },
 ];
 
 /**
@@ -65,7 +67,9 @@ export default function App() {
 
       {/* Main Content */}
       <main className="main-content">
-        {!connected ? (
+        {activeTab === 'loadtesting' ? (
+          <LoadTestingDashboard />
+        ) : !connected ? (
           <div className="connect-prompt">
             <div className="prompt-card">
               <span className="prompt-icon">🔗</span>
@@ -94,6 +98,11 @@ export default function App() {
                   <span>⛓️</span>
                   <strong>Cross-Chain</strong>
                   <p>Bridge property tokens across chains</p>
+                </div>
+                <div className="feature-item">
+                  <span>📊</span>
+                  <strong>Load Testing</strong>
+                  <p>View CI/CD performance metrics</p>
                 </div>
               </div>
             </div>
