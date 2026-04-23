@@ -5,7 +5,8 @@ edition = "2021"
 
 [features]
 default = []
-ingest = ["subxt"]
+# ingest feature broken with subxt 0.33 - requires API update
+# ingest = ["subxt"]
 
 [dependencies]
 anyhow = "1.0"
@@ -27,6 +28,6 @@ tower-http = { version = "0.5", features = ["trace", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.8", features = ["v4", "serde"] }
-subxt = { version = "0.33", optional = true }
+# subxt = { version = "0.33", optional = true }
 url = "2.5"
 
