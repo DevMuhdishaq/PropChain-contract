@@ -701,9 +701,8 @@ mod bridge {
             }
 
             let block = self.env().block_number();
-            let effective_at = block.saturating_add(
-                propchain_traits::constants::KEY_ROTATION_COOLDOWN_BLOCKS,
-            );
+            let effective_at =
+                block.saturating_add(propchain_traits::constants::KEY_ROTATION_COOLDOWN_BLOCKS);
 
             self.pending_admin_rotation = Some(propchain_traits::KeyRotationRequest {
                 old_account: caller,
@@ -733,9 +732,9 @@ mod bridge {
             if block < request.effective_at {
                 return Err(Error::InvalidRequest);
             }
-            let expiry = request.effective_at.saturating_add(
-                propchain_traits::constants::KEY_ROTATION_EXPIRY_BLOCKS,
-            );
+            let expiry = request
+                .effective_at
+                .saturating_add(propchain_traits::constants::KEY_ROTATION_EXPIRY_BLOCKS);
             if block > expiry {
                 self.pending_admin_rotation = None;
                 return Err(Error::RequestExpired);
@@ -797,5 +796,4 @@ mod bridge {
             base_gas + metadata_gas
         }
     }
-
 }

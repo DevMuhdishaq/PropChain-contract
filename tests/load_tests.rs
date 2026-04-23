@@ -24,13 +24,13 @@
 //! cargo test --package propchain-tests --test load_tests endurance_test_sustained_load --release -- --test-threads=4
 //! ```
 
-use ink_env::DefaultEnvironment;
 use ink::env::test::{default_accounts, set_caller};
+use ink_env::DefaultEnvironment;
 use propchain_contracts::propchain_contracts::PropertyRegistry as PropertyRegistryContract;
 use propchain_traits::*;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// Test configuration for load tests
 #[derive(Debug, Clone)]
@@ -132,12 +132,12 @@ impl LoadTestMetrics {
         *self.total_operations.lock().unwrap() += 1;
         *self.successful_operations.lock().unwrap() += 1;
         *self.total_response_time_ms.lock().unwrap() += response_time_ms;
-        
+
         let mut min = self.min_response_time_ms.lock().unwrap();
         if *min == 0 || response_time_ms < *min {
             *min = response_time_ms;
         }
-        
+
         let mut max = self.max_response_time_ms.lock().unwrap();
         if response_time_ms > *max {
             *max = response_time_ms;
@@ -175,15 +175,35 @@ impl LoadTestMetrics {
         println!("\n{}", "=".repeat(80));
         println!("LOAD TEST RESULTS: {}", test_name);
         println!("{}", "=".repeat(80));
-        println!("Total Operations:      {}", *self.total_operations.lock().unwrap());
-        println!("Successful:            {} ({:.2}%)", 
+        println!(
+            "Total Operations:      {}",
+            *self.total_operations.lock().unwrap()
+        );
+        println!(
+            "Successful:            {} ({:.2}%)",
             *self.successful_operations.lock().unwrap(),
-            self.success_rate());
-        println!("Failed:                {}", *self.failed_operations.lock().unwrap());
-        println!("Avg Response Time:     {:.2} ms", self.avg_response_time_ms());
-        println!("Min Response Time:     {} ms", *self.min_response_time_ms.lock().unwrap());
-        println!("Max Response Time:     {} ms", *self.max_response_time_ms.lock().unwrap());
-        println!("Ops/Second:            {:.2}", *self.ops_per_second.lock().unwrap());
+            self.success_rate()
+        );
+        println!(
+            "Failed:                {}",
+            *self.failed_operations.lock().unwrap()
+        );
+        println!(
+            "Avg Response Time:     {:.2} ms",
+            self.avg_response_time_ms()
+        );
+        println!(
+            "Min Response Time:     {} ms",
+            *self.min_response_time_ms.lock().unwrap()
+        );
+        println!(
+            "Max Response Time:     {} ms",
+            *self.max_response_time_ms.lock().unwrap()
+        );
+        println!(
+            "Ops/Second:            {:.2}",
+            *self.ops_per_second.lock().unwrap()
+        );
         println!("{}", "=".repeat(80));
     }
 }
@@ -221,12 +241,12 @@ pub fn simulate_user_registration(
 
     for i in 0..num_properties {
         let start = Instant::now();
-        
+
         let metadata = generate_property_metadata(user_id, i);
         let result = registry.register_property(metadata);
-        
+
         let elapsed = start.elapsed().as_millis();
-        
+
         match result {
             Ok(_) => metrics.record_success(elapsed as u128),
             Err(_) => metrics.record_failure(),
@@ -259,11 +279,11 @@ pub fn simulate_user_queries(
 
     for i in 0..num_queries {
         let start = Instant::now();
-        
+
         // Query different property IDs
         let property_id = i as u32;
         let _result = registry.get_property(property_id as u64);
-        
+
         let elapsed = start.elapsed().as_millis();
         metrics.record_success(elapsed as u128);
 
@@ -283,17 +303,17 @@ where
 {
     let metrics = LoadTestMetrics::default();
     let start_time = Instant::now();
-    
+
     println!("\n🚀 Starting Load Test: {}", test_name);
     println!("Configuration:");
     println!("  Concurrent Users: {}", config.concurrent_users);
     println!("  Duration: {} seconds", config.duration_secs);
     println!("  Ramp-up: {} seconds", config.ramp_up_secs);
     println!("  Target Ops/sec: {}", config.target_ops_per_second);
-    
+
     let mut handles = vec![];
     let task_fn = Arc::new(user_task);
-    
+
     // Spawn concurrent user threads
     for user_id in 0..config.concurrent_users {
         let config_clone = config.clone();
@@ -308,34 +328,34 @@ where
             peak_memory_mb: Arc::clone(&metrics.peak_memory_mb),
         };
         let task_fn_clone = Arc::clone(&task_fn);
-        
+
         let handle = thread::spawn(move || {
             task_fn_clone(user_id, &config_clone, &metrics_clone);
         });
-        
+
         handles.push(handle);
-        
+
         // Ramp-up delay
         if config.ramp_up_secs > 0 {
             let ramp_delay = Duration::from_millis(
-                (config.ramp_up_secs * 1000) / config.concurrent_users as u64
+                (config.ramp_up_secs * 1000) / config.concurrent_users as u64,
             );
             thread::sleep(ramp_delay);
         }
     }
-    
+
     // Wait for all threads to complete
     for handle in handles {
         handle.join().expect("Thread should complete successfully");
     }
-    
+
     // Calculate final metrics
     let total_duration = start_time.elapsed().as_secs_f64();
     let total_ops = *metrics.total_operations.lock().unwrap() as f64;
     *metrics.ops_per_second.lock().unwrap() = total_ops / total_duration;
-    
+
     metrics.print_summary(test_name);
-    
+
     metrics
 }
 
@@ -350,32 +370,41 @@ pub fn assert_performance_thresholds(
     let avg_response = metrics.avg_response_time_ms();
     let success_rate = metrics.success_rate();
     let ops_sec = *metrics.ops_per_second.lock().unwrap();
-    
+
     println!("\n📊 Performance Threshold Check: {}", test_name);
-    println!("  Avg Response: {:.2}ms (max: {:.2}ms)", avg_response, max_avg_response_ms);
-    println!("  Success Rate: {:.2}% (min: {:.2}%)", success_rate, min_success_rate);
-    println!("  Ops/Second: {:.2} (min: {:.2})", ops_sec, min_ops_per_second);
-    
+    println!(
+        "  Avg Response: {:.2}ms (max: {:.2}ms)",
+        avg_response, max_avg_response_ms
+    );
+    println!(
+        "  Success Rate: {:.2}% (min: {:.2}%)",
+        success_rate, min_success_rate
+    );
+    println!(
+        "  Ops/Second: {:.2} (min: {:.2})",
+        ops_sec, min_ops_per_second
+    );
+
     assert!(
         avg_response <= max_avg_response_ms,
         "Average response time {:.2}ms exceeds threshold {:.2}ms",
         avg_response,
         max_avg_response_ms
     );
-    
+
     assert!(
         success_rate >= min_success_rate,
         "Success rate {:.2}% below threshold {:.2}%",
         success_rate,
         min_success_rate
     );
-    
+
     assert!(
         ops_sec >= min_ops_per_second,
         "Operations/second {:.2} below threshold {:.2}",
         ops_sec,
         min_ops_per_second
     );
-    
+
     println!("✅ All performance thresholds met!");
 }
