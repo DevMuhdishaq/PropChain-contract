@@ -5711,6 +5711,7 @@ dependencies = [
  "ink 5.1.1",
  "ink_e2e",
  "parity-scale-codec",
+ "propchain-traits",
  "scale-info",
 ]
 
@@ -5828,6 +5829,7 @@ dependencies = [
  "ink 5.1.1",
  "ink_e2e",
  "parity-scale-codec",
+ "propchain-traits",
  "scale-info",
 ]
 

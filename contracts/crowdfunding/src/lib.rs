@@ -28,7 +28,6 @@ mod propchain_crowdfunding {
         ProposalNotFound,
         ProposalNotActive,
         InvalidParameters,
-        InvalidParameters,
         AlreadyVoted,
         ReentrantCall,
     }
