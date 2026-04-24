@@ -99,12 +99,7 @@ mod dex {
     }
 
     #[derive(
-        Debug,
-        Clone,
-        PartialEq,
-        scale::Encode,
-        scale::Decode,
-        ink::storage::traits::StorageLayout,
+        Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub struct TradingCompetition {
@@ -849,7 +844,8 @@ mod dex {
                 return Err(Error::InvalidRequest);
             }
 
-            self.competition_claimed.insert((competition_id, caller), &true);
+            self.competition_claimed
+                .insert((competition_id, caller), &true);
             let balance = self.governance_balances.get(caller).unwrap_or(0);
             self.governance_balances
                 .insert(caller, &balance.saturating_add(reward));
@@ -1177,18 +1173,15 @@ mod dex {
                 .get(competition_id)
                 .ok_or(Error::InvalidRequest)?;
             let current_block = u64::from(self.env().block_number());
-            competition.active = current_block >= competition.start_block
-                && current_block <= competition.end_block;
+            competition.active =
+                current_block >= competition.start_block && current_block <= competition.end_block;
             self.trading_competitions
                 .insert(competition_id, &competition);
             Ok(())
         }
 
         #[ink(message)]
-        pub fn tally_competition_leaderboard(
-            &self,
-            competition_id: u64,
-        ) -> Vec<(AccountId, u128)> {
+        pub fn tally_competition_leaderboard(&self, competition_id: u64) -> Vec<(AccountId, u128)> {
             self.get_competition_leaderboard(competition_id)
         }
 
@@ -2017,8 +2010,7 @@ mod dex {
                 if order.remaining_amount == 0 || order.price == 0 {
                     continue;
                 }
-                if let Some(existing) = levels.iter_mut().find(|level| level.price == order.price)
-                {
+                if let Some(existing) = levels.iter_mut().find(|level| level.price == order.price) {
                     existing.total_amount =
                         existing.total_amount.saturating_add(order.remaining_amount);
                     existing.order_count = existing.order_count.saturating_add(1);
