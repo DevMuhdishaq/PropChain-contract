@@ -242,6 +242,24 @@ fn load_test_with_monitoring() {
 }
 ```
 
+### Memory Leak Detection
+
+For long-running sessions, sample resident set size during the run so leak growth becomes visible before the test finishes.
+
+```rust
+if let Some(rss_mb) = current_process_memory_mb() {
+    metrics.record_peak_memory_mb(rss_mb);
+}
+
+// Compare peak RSS against the baseline captured at test start.
+// Stable endurance runs should stay within the configured leak budget.
+```
+
+Suggested leak budgets:
+- Short endurance runs: peak RSS growth under 24 MB
+- Sustained endurance runs: peak RSS growth under 32 MB
+- Final RSS drift after teardown: close to baseline
+
 ### Alert Conditions
 
 Configure alerts for immediate notification of issues:

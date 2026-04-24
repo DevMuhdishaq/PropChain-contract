@@ -68,7 +68,7 @@ run_load_test() {
     if [ -n "$test_pattern" ]; then
         cargo test --package "$PACKAGE" $test_pattern $RELEASE_FLAG -- $OUTPUT_FLAG
     else
-        cargo test --package "$PACKAGE" --test load_tests $RELEASE_FLAG -- $OUTPUT_FLAG
+        cargo test --package "$PACKAGE" $RELEASE_FLAG -- $OUTPUT_FLAG
     fi
     
     print_success "Load test completed: $description"
@@ -165,12 +165,12 @@ case "${1:-help}" in
     
     endurance)
         check_prerequisites
-        run_load_test "endurance_test" "Endurance Test Suite"
+        run_load_test "endurance_test_" "Endurance Test Suite"
         ;;
     
     scalability)
         check_prerequisites
-        run_load_test "scalability_test" "Scalability Test Suite"
+        run_load_test "scalability_test_memory_usage" "Scalability Memory Usage Test"
         ;;
     
     mixed)

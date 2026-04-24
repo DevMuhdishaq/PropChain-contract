@@ -23,10 +23,10 @@ This guide provides comprehensive instructions for running, understanding, and e
 
 ```bash
 # Run all load tests (takes ~30 minutes)
-cargo test --package propchain-tests --test load_tests --release
+cargo test --package propchain-tests --release
 
 # Run with output
-cargo test --package propchain-tests --test load_tests --release -- --nocapture
+cargo test --package propchain-tests --release -- --nocapture
 ```
 
 ### Run Specific Test Categories
@@ -39,10 +39,10 @@ cargo test --package propchain-tests load_test_concurrent_registration --release
 cargo test --package propchain-tests stress_test_ --release --nocapture
 
 # Endurance tests (5-10 minutes)
-cargo test --package propchain-tests endurance_test --release --nocapture
+cargo test --package propchain-tests endurance_test_short --release --nocapture
 
 # Scalability tests (10-15 minutes)
-cargo test --package propchain-tests scalability_test --release --nocapture
+cargo test --package propchain-tests scalability_test_memory_usage --release --nocapture
 ```
 
 ### Quick Performance Check
@@ -201,6 +201,8 @@ run_concurrent_load_test(
 | 1 min    | >96%         | <600ms       | Stable    |
 | 5 min    | >95%         | <800ms       | No degradation |
 
+Endurance runs now sample process RSS during execution and fail if memory growth exceeds the configured leak budget. This makes allocator growth and teardown leaks visible during long-running sessions instead of only at the end of the test.
+
 ### 4. Spike Tests
 
 **Purpose**: Validate system resilience to sudden load changes.
@@ -306,7 +308,7 @@ jobs:
       uses: dtolnay/rust-action@stable
     
     - name: Run Load Tests
-      run: cargo test --package propchain-tests --test load_tests --release
+      run: cargo test --package propchain-tests --release
     
     - name: Upload Results
       uses: actions/upload-artifact@v3
@@ -475,7 +477,7 @@ let config = LoadTestConfig {
 ```rust
 // Profile to identify hotspots
 cargo install flamegraph
-cargo flamegraph --test load_tests --test-threads=1
+cargo flamegraph -p propchain-tests endurance_test_short --test-threads=1
 
 // Check for lock contention
 // Look for long waits in mutex operations
@@ -513,6 +515,9 @@ cargo test --package propchain-tests <test_name> --release -- --test-threads=20
 ```bash
 # Monitor memory usage
 watch -n 1 'ps aux | grep propchain'
+
+# Endurance tests now print peak RSS and memory growth in the test summary
+./scripts/load_test.sh endurance
 
 # Reduce test scale
 let config = LoadTestConfig {

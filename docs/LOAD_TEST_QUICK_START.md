@@ -133,6 +133,9 @@ cargo test stress_test_mass_registration --release --nocapture
 
 # Short endurance for CI/CD
 cargo test endurance_test_short --release --nocapture
+
+# Sustained endurance with leak monitoring
+cargo test endurance_test_sustained_load --release --nocapture
 ```
 
 **When to use:** Weekly in staging, before deployments
@@ -145,6 +148,9 @@ cargo test endurance_test_short --release --nocapture
 
 # Database scaling
 cargo test scalability_test_growing_database --release --nocapture
+
+# Memory usage analysis
+cargo test scalability_test_memory_usage --release --nocapture
 ```
 
 **When to use:** Quarterly, capacity planning
@@ -212,7 +218,7 @@ tasklist  # Windows
 3. Profile to find bottlenecks:
 ```bash
 cargo install flamegraph
-cargo flamegraph --test load_tests
+cargo flamegraph -p propchain-tests endurance_test_short
 ```
 
 ### Low Throughput (<50% target)
@@ -323,7 +329,7 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - name: Run Load Tests
-      run: cargo test --package propchain-tests --test load_tests --release
+      run: cargo test --package propchain-tests --release
 ```
 
 ### Custom Metrics

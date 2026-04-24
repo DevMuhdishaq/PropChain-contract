@@ -74,9 +74,11 @@ function Run-LoadTest {
     Write-Host ""
     
     $cargoArgs = @("test", "--package", $Package, $ReleaseFlag, $OutputFlag)
-    
+
     if ($TestPattern) {
         $cargoArgs += $TestPattern
+    } else {
+        $cargoArgs = @("test", "--package", $Package, $ReleaseFlag, $OutputFlag)
     }
     
     & cargo @cargoArgs
@@ -181,12 +183,12 @@ switch ($Command.ToLower()) {
     
     "endurance" {
         Check-Prerequisites
-        Run-LoadTest -TestPattern "endurance_test" -Description "Endurance Test Suite"
+        Run-LoadTest -TestPattern "endurance_test_" -Description "Endurance Test Suite"
     }
     
     "scalability" {
         Check-Prerequisites
-        Run-LoadTest -TestPattern "scalability_test" -Description "Scalability Test Suite"
+        Run-LoadTest -TestPattern "scalability_test_memory_usage" -Description "Scalability Memory Usage Test"
     }
     
     "mixed" {

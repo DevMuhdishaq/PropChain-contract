@@ -15,19 +15,20 @@
 //!
 //! ```rust,ignore
 //! // Run concurrent registration test
-//! cargo test --package propchain-tests --test load_tests test_concurrent_property_registration --release
+//! cargo test --package propchain-tests load_test_concurrent_registration --release
 //!
 //! // Run stress test with custom concurrency
-//! cargo test --package propchain-tests --test load_tests stress_test_mass_registration --release -- --test-threads=10
+//! cargo test --package propchain-tests stress_test_mass_registration --release -- --test-threads=10
 //!
 //! // Run endurance test
-//! cargo test --package propchain-tests --test load_tests endurance_test_sustained_load --release -- --test-threads=4
+//! cargo test --package propchain-tests endurance_test_sustained_load --release -- --test-threads=4
 //! ```
 
 use ink::env::test::{default_accounts, set_caller};
 use ink_env::DefaultEnvironment;
 use propchain_contracts::propchain_contracts::PropertyRegistry as PropertyRegistryContract;
 use propchain_traits::*;
+use std::fs;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -150,6 +151,14 @@ impl LoadTestMetrics {
         *self.failed_operations.lock().unwrap() += 1;
     }
 
+    /// Update the recorded peak memory usage.
+    pub fn record_peak_memory_mb(&self, memory_mb: f64) {
+        let mut peak = self.peak_memory_mb.lock().unwrap();
+        if memory_mb > *peak {
+            *peak = memory_mb;
+        }
+    }
+
     /// Calculate average response time
     pub fn avg_response_time_ms(&self) -> f64 {
         let total_ops = *self.successful_operations.lock().unwrap();
@@ -203,6 +212,10 @@ impl LoadTestMetrics {
         println!(
             "Ops/Second:            {:.2}",
             *self.ops_per_second.lock().unwrap()
+        );
+        println!(
+            "Peak Memory:           {:.2} MB",
+            *self.peak_memory_mb.lock().unwrap()
         );
         println!("{}", "=".repeat(80));
     }
@@ -409,7 +422,251 @@ pub fn assert_performance_thresholds(
     println!("✅ All performance thresholds met!");
 }
 
+/// Return the current process resident set size in megabytes when available.
+fn current_process_memory_mb() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(value) = line.strip_prefix("VmRSS:") {
+                let kib = value.split_whitespace().next()?.parse::<f64>().ok()?;
+                return Some(kib / 1024.0);
+            }
+        }
+        None
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MemorySample {
+    elapsed_secs: f64,
+    rss_mb: f64,
+}
+
+#[derive(Debug)]
+struct MemoryLeakReport {
+    baseline_rss_mb: f64,
+    peak_rss_mb: f64,
+    final_rss_mb: f64,
+    samples: Vec<MemorySample>,
+}
+
+impl MemoryLeakReport {
+    fn growth_mb(&self) -> f64 {
+        self.peak_rss_mb - self.baseline_rss_mb
+    }
+}
+
+struct MemoryLeakMonitor {
+    samples: Arc<Mutex<Vec<MemorySample>>>,
+    peak_rss_mb: Arc<Mutex<f64>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl MemoryLeakMonitor {
+    fn start(sample_interval: Duration) -> Option<Self> {
+        let baseline_rss_mb = current_process_memory_mb()?;
+        let samples = Arc::new(Mutex::new(vec![MemorySample {
+            elapsed_secs: 0.0,
+            rss_mb: baseline_rss_mb,
+        }]));
+        let peak_rss_mb = Arc::new(Mutex::new(baseline_rss_mb));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let start_time = Instant::now();
+
+        let samples_clone = Arc::clone(&samples);
+        let peak_clone = Arc::clone(&peak_rss_mb);
+        let stop_clone = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !stop_clone.load(std::sync::atomic::Ordering::SeqCst) {
+                thread::sleep(sample_interval);
+                if let Some(rss_mb) = current_process_memory_mb() {
+                    let elapsed_secs = start_time.elapsed().as_secs_f64();
+                    samples_clone.lock().unwrap().push(MemorySample {
+                        elapsed_secs,
+                        rss_mb,
+                    });
+                    let mut peak = peak_clone.lock().unwrap();
+                    if rss_mb > *peak {
+                        *peak = rss_mb;
+                    }
+                }
+            }
+        });
+
+        Some(Self {
+            samples,
+            peak_rss_mb,
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    fn finish(mut self) -> MemoryLeakReport {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            handle.join().expect("memory monitor thread should stop");
+        }
+
+        let samples = self.samples.lock().unwrap().clone();
+        let baseline_rss_mb = samples
+            .first()
+            .map(|sample| sample.rss_mb)
+            .unwrap_or_default();
+        let final_rss_mb = samples
+            .last()
+            .map(|sample| sample.rss_mb)
+            .unwrap_or(baseline_rss_mb);
+        let peak_rss_mb = *self.peak_rss_mb.lock().unwrap();
+
+        MemoryLeakReport {
+            baseline_rss_mb,
+            peak_rss_mb,
+            final_rss_mb,
+            samples,
+        }
+    }
+
+    fn record_current_peak(&self, metrics: &LoadTestMetrics) {
+        if let Some(rss_mb) = current_process_memory_mb() {
+            metrics.record_peak_memory_mb(rss_mb);
+        }
+    }
+}
+
+fn assert_memory_growth_bounded(
+    report: &MemoryLeakReport,
+    test_name: &str,
+    max_growth_mb: f64,
+    max_final_drift_mb: f64,
+) {
+    let growth_mb = report.growth_mb();
+    let final_drift_mb = report.final_rss_mb - report.baseline_rss_mb;
+
+    println!("\n🧠 Memory Leak Check: {}", test_name);
+    println!(
+        "  Baseline RSS: {:.2} MB | Peak RSS: {:.2} MB | Final RSS: {:.2} MB",
+        report.baseline_rss_mb, report.peak_rss_mb, report.final_rss_mb
+    );
+    println!(
+        "  Growth: {:.2} MB (max {:.2} MB) | Final drift: {:.2} MB (max {:.2} MB)",
+        growth_mb, max_growth_mb, final_drift_mb, max_final_drift_mb
+    );
+    if let Some(last_sample) = report.samples.last() {
+        println!("  Sample Span: {:.2} sec", last_sample.elapsed_secs);
+    }
+    println!("  Samples captured: {}", report.samples.len());
+
+    assert!(
+        growth_mb <= max_growth_mb,
+        "memory growth {:.2} MB exceeds threshold {:.2} MB",
+        growth_mb,
+        max_growth_mb
+    );
+    assert!(
+        final_drift_mb <= max_final_drift_mb,
+        "final RSS drift {:.2} MB exceeds threshold {:.2} MB",
+        final_drift_mb,
+        max_final_drift_mb
+    );
+}
+
+fn run_memory_hygiene_session(
+    iterations: usize,
+    properties_per_cycle: usize,
+    delay_ms: u64,
+    monitor_interval_ms: u64,
+) -> (LoadTestMetrics, MemoryLeakReport) {
+    let metrics = LoadTestMetrics::default();
+    let monitor = MemoryLeakMonitor::start(Duration::from_millis(monitor_interval_ms))
+        .expect("memory monitoring requires a supported platform");
+    let start = Instant::now();
+    let accounts = default_accounts::<DefaultEnvironment>();
+
+    for cycle in 0..iterations {
+        let caller = match cycle % 5 {
+            0 => accounts.alice,
+            1 => accounts.bob,
+            2 => accounts.charlie,
+            3 => accounts.django,
+            _ => accounts.eve,
+        };
+        set_caller::<DefaultEnvironment>(caller);
+
+        let mut registry = PropertyRegistryContract::new();
+
+        for property in 0..properties_per_cycle {
+            let operation_start = Instant::now();
+            let metadata = generate_property_metadata(cycle, property);
+            registry
+                .register_property(metadata)
+                .expect("property registration should succeed");
+
+            let elapsed = operation_start.elapsed().as_millis();
+            metrics.record_success(elapsed);
+            monitor.record_current_peak(&metrics);
+        }
+
+        let query_start = Instant::now();
+        let _ = registry.get_owner_properties(caller);
+        metrics.record_success(query_start.elapsed().as_millis());
+        monitor.record_current_peak(&metrics);
+
+        if delay_ms > 0 {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
+    }
+
+    let elapsed_secs = start.elapsed().as_secs_f64().max(0.001);
+    let total_ops = *metrics.total_operations.lock().unwrap() as f64;
+    *metrics.ops_per_second.lock().unwrap() = total_ops / elapsed_secs;
+
+    let report = monitor.finish();
+    metrics.record_peak_memory_mb(report.peak_rss_mb);
+    (metrics, report)
+}
+
 // ── API Rate Limit Tests (Issue #162) ─────────────────────────────────────────
+
+#[cfg(test)]
+mod memory_leak_monitoring_tests {
+    use super::*;
+
+    #[test]
+    fn endurance_test_short() {
+        let (metrics, report) = run_memory_hygiene_session(18, 3, 15, 100);
+        metrics.print_summary("Endurance Test - Short");
+        assert_memory_growth_bounded(&report, "Endurance Test - Short", 24.0, 12.0);
+        assert!(
+            metrics.success_rate() >= 95.0,
+            "short endurance session should remain stable"
+        );
+    }
+
+    #[test]
+    fn endurance_test_sustained_load() {
+        let (metrics, report) = run_memory_hygiene_session(40, 4, 10, 100);
+        metrics.print_summary("Endurance Test - Sustained Load");
+        assert_memory_growth_bounded(&report, "Endurance Test - Sustained Load", 32.0, 16.0);
+        assert!(
+            *metrics.ops_per_second.lock().unwrap() > 0.0,
+            "sustained load should record throughput"
+        );
+    }
+
+    #[test]
+    fn scalability_test_memory_usage() {
+        let (metrics, report) = run_memory_hygiene_session(24, 6, 5, 100);
+        metrics.print_summary("Scalability Test - Memory Usage");
+        assert_memory_growth_bounded(&report, "Scalability Test - Memory Usage", 28.0, 14.0);
+    }
+}
 
 #[cfg(test)]
 mod api_rate_limit_tests {
