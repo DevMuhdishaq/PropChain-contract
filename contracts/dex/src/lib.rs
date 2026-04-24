@@ -871,7 +871,7 @@ mod dex {
         ) {
             let current_block = u64::from(self.env().block_number());
             for competition_id in 1..=self.trade_competition_counter {
-                if let Some(mut competition) = self.trading_competitions.get(competition_id) {
+                if let Some(competition) = self.trading_competitions.get(competition_id) {
                     if !competition.active
                         || current_block < competition.start_block
                         || current_block > competition.end_block
