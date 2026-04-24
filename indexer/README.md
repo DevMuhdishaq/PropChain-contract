@@ -21,7 +21,13 @@ API
 - GET /events
   - Query params: `contract`, `event_type`, `topic`, `from_ts`, `to_ts`, `from_block`, `to_block`, `limit`, `offset`
   - `from_ts`/`to_ts` use RFC3339 timestamps
+- GET /contracts
 - GET /metrics (Prometheus)
+
+API Documentation
+
+- Swagger UI: http://localhost:8088/swagger-ui/
+- OpenAPI JSON: http://localhost:8088/api-docs/openapi.json
 
 Storage layout
 

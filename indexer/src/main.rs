@@ -2,8 +2,10 @@ mod api;
 mod db;
 #[cfg(feature = "ingest")]
 mod ingest;
+mod openapi;
 
 use crate::api::{health, list_events, ApiState};
+use crate::openapi::ApiDoc;
 use anyhow::Context;
 use axum::{routing::get, Router};
 use axum_prometheus::PrometheusMetricLayer;
@@ -14,6 +16,8 @@ use tokio::net::TcpListener;
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 #[derive(Parser, Debug)]
 #[command(name = "propchain-indexer")]
@@ -78,12 +82,16 @@ async fn main() -> anyhow::Result<()> {
 
     let api_state = ApiState { db: db.clone() };
 
-    let app = Router::new()
+    let api_routes = Router::new()
         .route("/health", get(health))
         .route("/events", get(list_events))
         .route("/contracts", get(crate::api::list_contracts))
         .route("/metrics", get(|| async move { metric_handle.render() }))
-        .with_state(api_state)
+        .with_state(api_state);
+
+    let app = Router::new()
+        .merge(api_routes)
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .layer(prometheus_layer)
         .layer(cors)
         .layer(governor_layer);

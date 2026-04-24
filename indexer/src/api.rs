@@ -8,23 +8,54 @@ pub struct ApiState {
     pub db: Arc<Db>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams, utoipa::ToSchema)]
+#[into_params(parameter_in = Query)]
 pub struct EventsParams {
+    /// Filter by contract address
     pub contract: Option<String>,
+    /// Filter by event type name
     pub event_type: Option<String>,
+    /// Filter by a topic value (matches any element in the topics array)
     pub topic: Option<String>,
+    /// Lower bound timestamp (RFC3339)
     pub from_ts: Option<String>,
+    /// Upper bound timestamp (RFC3339)
     pub to_ts: Option<String>,
+    /// Lower bound block number (inclusive)
     pub from_block: Option<i64>,
+    /// Upper bound block number (inclusive)
     pub to_block: Option<i64>,
+    /// Max records to return (1–1000, default 100)
+    #[param(minimum = 1, maximum = 1000)]
     pub limit: Option<i64>,
+    /// Number of records to skip (>= 0)
+    #[param(minimum = 0)]
     pub offset: Option<i64>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "System",
+    responses(
+        (status = 200, description = "Service is healthy", body = String)
+    )
+)]
 pub async fn health() -> &'static str {
     "ok"
 }
 
+#[utoipa::path(
+    get,
+    path = "/events",
+    tag = "Events",
+    params(EventsParams),
+    responses(
+        (status = 200, description = "Paginated list of indexed contract events", body = Vec<IndexedEvent>),
+        (status = 400, description = "Invalid query parameters"),
+        (status = 500, description = "Database error")
+    )
+)]
 pub async fn list_events(
     state: axum::extract::State<ApiState>,
     Query(params): Query<EventsParams>,
@@ -97,6 +128,15 @@ pub async fn list_events(
     Ok(Json(res))
 }
 
+#[utoipa::path(
+    get,
+    path = "/contracts",
+    tag = "Events",
+    responses(
+        (status = 200, description = "Distinct list of contract addresses with indexed events", body = Vec<String>),
+        (status = 500, description = "Database error")
+    )
+)]
 pub async fn list_contracts(
     state: axum::extract::State<ApiState>,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {

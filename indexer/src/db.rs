@@ -114,15 +114,18 @@ pub struct EventQuery {
     pub offset: Option<i64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct IndexedEvent {
+    /// Unique record identifier (UUID v4)
     pub id: Uuid,
     pub block_number: i64,
     pub block_hash: String,
+    /// RFC3339 timestamp of the block
     pub block_timestamp: DateTime<Utc>,
     pub contract: String,
     pub event_type: Option<String>,
     pub topics: Option<Vec<String>>,
+    /// Raw event payload as hex-encoded bytes
     pub payload_hex: String,
 }
 
