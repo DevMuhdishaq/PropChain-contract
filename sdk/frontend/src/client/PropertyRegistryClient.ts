@@ -37,7 +37,7 @@ import type {
   FractionalInfo,
   FeeOperation,
 } from '../types';
-import { PropChainError, TransactionError, decodeContractError } from '../utils/errors';
+import { PropChainError, TransactionError, decodeContractError, GasEstimationError } from '../utils/errors';
 import { decodeTransactionEvents, subscribeToNamedEvent } from '../utils/events';
 import type { PropChainEventName, PropChainEventMap } from '../types/events';
 
@@ -81,11 +81,13 @@ export class PropertyRegistryClient {
   private readonly api: ApiPromise;
   private readonly abi: Abi;
   private readonly contractAddress: string;
+  private readonly options: ClientOptions;
 
-  constructor(api: ApiPromise, contractAddress: string, abi: Abi) {
+  constructor(api: ApiPromise, contractAddress: string, abi: Abi, options?: ClientOptions) {
     this.api = api;
     this.abi = abi;
     this.contractAddress = contractAddress;
+    this.options = options ?? {};
     this.contract = new ContractPromise(api, abi, contractAddress);
   }
 
@@ -639,7 +641,8 @@ export class PropertyRegistryClient {
 
     if (dryRunResult.isErr) {
       const errorVariant = dryRunResult.asErr?.toString() ?? 'Unknown';
-      throw decodeContractError(errorVariant);
+      const cause = decodeContractError(errorVariant);
+      throw new GasEstimationError(method, cause);
     }
 
     // Submit the actual transaction
@@ -648,8 +651,11 @@ export class PropertyRegistryClient {
       throw new Error(`Unknown tx method: ${method}`);
     }
 
+    // Apply safety buffer to estimated gas
+    const gasLimit = await this.applyGasBuffer(BigInt(gasRequired?.toString() ?? '0'));
+
     return new Promise<TxResult>((resolve, reject) => {
-      const tx = txFn({ gasLimit: gasRequired }, ...args);
+      const tx = txFn({ gasLimit }, ...args);
 
       const signOptions = typeof signer === 'string' ? {} : undefined;
 
@@ -722,5 +728,41 @@ export class PropertyRegistryClient {
       },
       registeredAt: data.registered_at as number,
     };
+  }
+
+  /**
+   * Applies a safety buffer to the estimated gas required for a transaction.
+   * If autoAdjustGas is enabled, the buffer scales with network congestion.
+   */
+  private async applyGasBuffer(estimatedGas: bigint): Promise<bigint> {
+    let bufferPercentage = this.options.gasBufferPercentage ?? 10;
+
+    if (this.options.autoAdjustGas) {
+      try {
+        // Dynamic adjustment based on contract health and metrics
+        const health = await this.healthCheck();
+        if (health && health.isHealthy) {
+          // Increase buffer if we're near the current block's target or if paused/recovering
+          if (health.isPaused) {
+            bufferPercentage += 20; // Extra safety during maintenance/pause
+          }
+
+          const metrics = await this.getGasMetrics();
+          if (metrics && metrics.averageOperationGas > 0) {
+            const utilizationRatio =
+              Number(metrics.lastOperationGas) / metrics.averageOperationGas;
+            if (utilizationRatio > 1.5) {
+              bufferPercentage += 15; // High volatility detected
+            }
+          }
+        }
+      } catch (error) {
+        // Fallback to default buffer if metrics lookup fails
+        console.warn('Failed to fetch gas metrics for auto-adjustment, using default buffer.');
+      }
+    }
+
+    const buffer = (estimatedGas * BigInt(bufferPercentage)) / 100n;
+    return estimatedGas + buffer;
   }
 }

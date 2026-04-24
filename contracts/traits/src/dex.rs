@@ -157,6 +157,54 @@ pub struct PairAnalytics {
     pub best_ask: u128,
     pub volatility_bips: u32,
     pub last_updated: u64,
+    pub high_24h: u128,
+    pub low_24h: u128,
+    pub volume_24h: u128,
+    pub trade_count_24h: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, scale::Encode, scale::Decode)]
+#[cfg_attr(
+    feature = "std",
+    derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+)]
+pub struct TradingStatistics {
+    pub total_pairs: u64,
+    pub total_volume_24h: u128,
+    pub total_trades_24h: u64,
+    pub most_active_pair: Option<u64>,
+    pub highest_volume_pair: Option<u64>,
+    pub average_volatility_bips: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, scale::Encode, scale::Decode)]
+#[cfg_attr(
+    feature = "std",
+    derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+)]
+pub struct PriceHistory {
+    pub pair_id: u64,
+    pub current_price: u128,
+    pub high_24h: u128,
+    pub low_24h: u128,
+    pub twap_price: u128,
+    pub reference_price: u128,
+    pub volatility_bips: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, scale::Encode, scale::Decode)]
+#[cfg_attr(
+    feature = "std",
+    derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+)]
+pub struct VolumeAnalytics {
+    pub pair_id: u64,
+    pub volume_24h: u128,
+    pub cumulative_volume: u128,
+    pub trade_count_24h: u64,
+    pub total_trade_count: u64,
+    pub liquidity_base: u128,
+    pub liquidity_quote: u128,
 }
 
 // =========================================================================

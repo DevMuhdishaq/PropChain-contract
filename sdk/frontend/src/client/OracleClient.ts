@@ -22,7 +22,7 @@ import type {
   TxResult,
   ContractEvent,
 } from '../types';
-import { decodeContractError, TransactionError } from '../utils/errors';
+import { decodeContractError, TransactionError, GasEstimationError } from '../utils/errors';
 import { decodeTransactionEvents } from '../utils/events';
 
 export type Signer = KeyringPair | string;
@@ -48,11 +48,13 @@ export class OracleClient {
   private readonly api: ApiPromise;
   private readonly abi: Abi;
   private readonly contractAddress: string;
+  private readonly options: ClientOptions;
 
-  constructor(api: ApiPromise, contractAddress: string, abi: Abi) {
+  constructor(api: ApiPromise, contractAddress: string, abi: Abi, options?: ClientOptions) {
     this.api = api;
     this.abi = abi;
     this.contractAddress = contractAddress;
+    this.options = options ?? {};
     this.contract = new ContractPromise(api, abi, contractAddress);
   }
 
@@ -224,7 +226,8 @@ export class OracleClient {
 
     if (dryRunResult.isErr) {
       const errorVariant = dryRunResult.asErr?.toString() ?? 'Unknown';
-      throw decodeContractError(errorVariant);
+      const cause = decodeContractError(errorVariant);
+      throw new GasEstimationError(method, cause);
     }
 
     const txFn = this.contract.tx[method];
@@ -232,8 +235,11 @@ export class OracleClient {
       throw new Error(`Unknown tx method: ${method}`);
     }
 
+    // Apply safety buffer to estimated gas
+    const gasLimit = await this.applyGasBuffer(BigInt(gasRequired?.toString() ?? '0'));
+
     return new Promise<TxResult>((resolve, reject) => {
-      const tx = txFn({ gasLimit: gasRequired }, ...args);
+      const tx = txFn({ gasLimit }, ...args);
 
       tx.signAndSend(
         signer as KeyringPair,
@@ -271,5 +277,14 @@ export class OracleClient {
         },
       ).catch(reject);
     });
+  }
+
+  /**
+   * Applies a safety buffer to the estimated gas required for a transaction.
+   */
+  private async applyGasBuffer(estimatedGas: bigint): Promise<bigint> {
+    const bufferPercentage = this.options.gasBufferPercentage ?? 10;
+    const buffer = (estimatedGas * BigInt(bufferPercentage)) / 100n;
+    return estimatedGas + buffer;
   }
 }

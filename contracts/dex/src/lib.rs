@@ -43,6 +43,16 @@ mod dex {
     }
 
     #[ink(event)]
+    pub struct PriceImpactWarning {
+        #[ink(topic)]
+        pub pair_id: u64,
+        #[ink(topic)]
+        pub trader: AccountId,
+        pub price_impact_bips: u32,
+        pub amount_in: u128,
+    }
+
+    #[ink(event)]
     pub struct OrderPlaced {
         #[ink(topic)]
         pub order_id: u64,
@@ -252,6 +262,10 @@ mod dex {
                     best_ask: 0,
                     volatility_bips: 0,
                     last_updated: self.env().block_timestamp(),
+                    high_24h: last_price,
+                    low_24h: last_price,
+                    volume_24h: 0,
+                    trade_count_24h: 0,
                 },
             );
             self.last_reward_block
@@ -1617,9 +1631,161 @@ mod dex {
             }
         }
 
+        /// Calculate the expected price impact for a given trade amount.
+        /// Returns the price impact in basis points (bips) and the expected output amount.
+        /// This allows users to check the impact before executing a trade.
+        #[ink(message)]
+        pub fn calculate_price_impact(
+            &self,
+            pair_id: u64,
+            side: OrderSide,
+            amount_in: u128,
+        ) -> Result<(u32, u128), Error> {
+            if amount_in == 0 {
+                return Err(Error::InvalidOrder);
+            }
+            let pool = self.pool(pair_id)?;
+            let fee_adjusted_in = amount_in
+                .saturating_mul(BIPS_DENOMINATOR.saturating_sub(pool.fee_bips as u128))
+                .checked_div(BIPS_DENOMINATOR)
+                .unwrap_or(0);
+
+            let (reserve_in, reserve_out) = match side {
+                OrderSide::Sell => (pool.reserve_base, pool.reserve_quote),
+                OrderSide::Buy => (pool.reserve_quote, pool.reserve_base),
+            };
+            if reserve_in == 0 || reserve_out == 0 {
+                return Err(Error::InsufficientLiquidity);
+            }
+
+            let amount_out = fee_adjusted_in
+                .saturating_mul(reserve_out)
+                .checked_div(reserve_in.saturating_add(fee_adjusted_in))
+                .unwrap_or(0);
+
+            let price_before = reserve_out
+                .saturating_mul(BIPS_DENOMINATOR)
+                .checked_div(reserve_in)
+                .unwrap_or(0);
+
+            let reserve_in_after = reserve_in.saturating_add(amount_in);
+            let reserve_out_after = reserve_out.saturating_sub(amount_out);
+            let price_after = if reserve_in_after > 0 {
+                reserve_out_after
+                    .saturating_mul(BIPS_DENOMINATOR)
+                    .checked_div(reserve_in_after)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
+            let price_impact_bips = if price_before > 0 {
+                price_before
+                    .abs_diff(price_after)
+                    .saturating_mul(BIPS_DENOMINATOR)
+                    .checked_div(price_before)
+                    .unwrap_or(0) as u32
+            } else {
+                0
+            };
+
+            Ok((price_impact_bips, amount_out))
+        }
+
         #[ink(message)]
         pub fn get_governance_balance(&self, account: AccountId) -> u128 {
             self.governance_balances.get(account).unwrap_or(0)
+        }
+
+        /// Get comprehensive trading statistics across all pairs
+        #[ink(message)]
+        pub fn get_trading_statistics(&self) -> TradingStatistics {
+            let mut total_volume_24h = 0u128;
+            let mut total_trades_24h = 0u64;
+            let mut most_active_pair = None;
+            let mut highest_volume_pair = None;
+            let mut max_trades = 0u64;
+            let mut max_volume = 0u128;
+            let mut total_volatility = 0u32;
+            let mut pairs_with_volatility = 0u32;
+
+            for pair_id in 1..=self.pair_counter {
+                if let Some(analytics) = self.analytics.get(pair_id) {
+                    total_volume_24h = total_volume_24h.saturating_add(analytics.volume_24h);
+                    total_trades_24h = total_trades_24h.saturating_add(analytics.trade_count_24h);
+                    total_volatility = total_volatility.saturating_add(analytics.volatility_bips);
+                    pairs_with_volatility = pairs_with_volatility.saturating_add(1);
+
+                    if analytics.trade_count_24h > max_trades {
+                        max_trades = analytics.trade_count_24h;
+                        most_active_pair = Some(pair_id);
+                    }
+
+                    if analytics.volume_24h > max_volume {
+                        max_volume = analytics.volume_24h;
+                        highest_volume_pair = Some(pair_id);
+                    }
+                }
+            }
+
+            let average_volatility_bips = if pairs_with_volatility > 0 {
+                total_volatility / pairs_with_volatility
+            } else {
+                0
+            };
+
+            TradingStatistics {
+                total_pairs: self.pair_counter,
+                total_volume_24h,
+                total_trades_24h,
+                most_active_pair,
+                highest_volume_pair,
+                average_volatility_bips,
+            }
+        }
+
+        /// Get price history summary for a trading pair
+        #[ink(message)]
+        pub fn get_price_history(&self, pair_id: u64) -> Option<PriceHistory> {
+            let analytics = self.analytics.get(pair_id)?;
+            Some(PriceHistory {
+                pair_id,
+                current_price: analytics.last_price,
+                high_24h: analytics.high_24h,
+                low_24h: analytics.low_24h,
+                twap_price: analytics.twap_price,
+                reference_price: analytics.reference_price,
+                volatility_bips: analytics.volatility_bips,
+            })
+        }
+
+        /// Get volume analytics for a trading pair
+        #[ink(message)]
+        pub fn get_volume_analytics(&self, pair_id: u64) -> Option<VolumeAnalytics> {
+            let analytics = self.analytics.get(pair_id)?;
+            let pool = self.pools.get(pair_id)?;
+
+            Some(VolumeAnalytics {
+                pair_id,
+                volume_24h: analytics.volume_24h,
+                cumulative_volume: analytics.cumulative_volume,
+                trade_count_24h: analytics.trade_count_24h,
+                total_trade_count: analytics.trade_count,
+                liquidity_base: pool.reserve_base,
+                liquidity_quote: pool.reserve_quote,
+            })
+        }
+
+        /// Get analytics for all trading pairs
+        #[ink(message)]
+        pub fn get_all_pair_analytics(&self) -> Vec<PairAnalytics> {
+            let mut analytics_list = Vec::new();
+            for pair_id in 1..=self.pair_counter {
+                if let Some(analytics) = self.analytics.get(pair_id) {
+                    analytics_list.push(analytics);
+                }
+            }
+            analytics_list
         }
 
         fn swap(
@@ -1656,6 +1822,47 @@ mod dex {
                 return Err(Error::SlippageExceeded);
             }
 
+            // Calculate price impact before executing the trade
+            let price_before = if reserve_in > 0 {
+                reserve_out
+                    .saturating_mul(BIPS_DENOMINATOR)
+                    .checked_div(reserve_in)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
+            let reserve_in_after = reserve_in.saturating_add(amount_in);
+            let reserve_out_after = reserve_out.saturating_sub(amount_out);
+            let price_after = if reserve_in_after > 0 {
+                reserve_out_after
+                    .saturating_mul(BIPS_DENOMINATOR)
+                    .checked_div(reserve_in_after)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
+            let price_impact_bips = if price_before > 0 {
+                price_before
+                    .abs_diff(price_after)
+                    .saturating_mul(BIPS_DENOMINATOR)
+                    .checked_div(price_before)
+                    .unwrap_or(0) as u32
+            } else {
+                0
+            };
+
+            // Emit price impact warning if impact exceeds 3% (300 bips)
+            if price_impact_bips > 300 {
+                self.env().emit_event(PriceImpactWarning {
+                    pair_id,
+                    trader: caller,
+                    price_impact_bips,
+                    amount_in,
+                });
+            }
+
             match side {
                 OrderSide::Sell => {
                     pool.reserve_base = pool.reserve_base.saturating_add(amount_in);
@@ -1681,6 +1888,17 @@ mod dex {
             analytics.trade_count = analytics.trade_count.saturating_add(1);
             analytics.volatility_bips = volatility_bips(previous, analytics.last_price);
             analytics.last_updated = self.env().block_timestamp();
+
+            // Update 24h statistics
+            if analytics.high_24h == 0 || pool.last_price > analytics.high_24h {
+                analytics.high_24h = pool.last_price;
+            }
+            if analytics.low_24h == 0 || pool.last_price < analytics.low_24h {
+                analytics.low_24h = pool.last_price;
+            }
+            analytics.volume_24h = analytics.volume_24h.saturating_add(amount_in);
+            analytics.trade_count_24h = analytics.trade_count_24h.saturating_add(1);
+
             self.analytics.insert(pair_id, &analytics);
             self.refresh_best_quotes(pair_id);
 
@@ -1702,6 +1920,8 @@ mod dex {
             });
 
             self.update_trade_competition_score(pair_id, caller, amount_out);
+            // After swap, check for executable limit orders
+            self.process_executable_limit_orders(pair_id)?;
 
             Ok(amount_out)
         }
@@ -1813,6 +2033,70 @@ mod dex {
             self.analytics.insert(pair_id, &analytics);
         }
 
+        /// Process and execute all limit orders that have become executable after a price change.
+        /// This is called after each swap to ensure limit orders are filled when their price
+        /// conditions are met.
+        fn process_executable_limit_orders(&mut self, pair_id: u64) -> Result<(), Error> {
+            let count = self.order_book_count.get(pair_id).unwrap_or(0);
+            if count == 0 {
+                return Ok(());
+            }
+
+            // Collect order IDs that need to be executed
+            let mut orders_to_execute: Vec<u64> = Vec::new();
+
+            for idx in 0..count {
+                let order_id = match self.order_book.get((pair_id, idx)) {
+                    Some(order_id) => order_id,
+                    None => continue,
+                };
+
+                let order = match self.orders.get(order_id) {
+                    Some(order) => order,
+                    None => continue,
+                };
+
+                // Only process limit orders that are open or partially filled
+                if !matches!(order.order_type, OrderType::Limit) {
+                    continue;
+                }
+
+                if !matches!(
+                    order.status,
+                    OrderStatus::Open | OrderStatus::PartiallyFilled
+                ) {
+                    continue;
+                }
+
+                // Check if the limit order is now executable
+                if self.is_order_executable(&order)? {
+                    orders_to_execute.push(order_id);
+                }
+            }
+
+            // Execute collected orders
+            for order_id in orders_to_execute {
+                // Reload order to get latest state (may have been partially filled by previous executions)
+                let order = match self.orders.get(order_id) {
+                    Some(order) => order,
+                    None => continue,
+                };
+
+                if order.remaining_amount > 0
+                    && matches!(
+                        order.status,
+                        OrderStatus::Open | OrderStatus::PartiallyFilled
+                    )
+                {
+                    // Execute the order with its remaining amount
+                    // Ignore errors from individual order executions to continue processing others
+                    let _ = self.execute_order(order_id, order.remaining_amount);
+                }
+            }
+
+            Ok(())
+        }
+
         fn reference_price_from_book(&self, pair_id: u64, fallback: u128) -> u128 {
             let analytics = self.analytics_for(pair_id);
             if analytics.best_bid > 0 && analytics.best_ask > 0 {
@@ -1875,6 +2159,10 @@ mod dex {
                 best_ask: 0,
                 volatility_bips: 0,
                 last_updated: 0,
+                high_24h: 0,
+                low_24h: 0,
+                volume_24h: 0,
+                trade_count_24h: 0,
             })
         }
     }
@@ -1935,5 +2223,6 @@ mod dex {
             .unwrap_or(0) as u32
     }
 
-    // Unit tests extracted to tests.rs (Issue #101)
+    // Include unit tests
+    include!("tests.rs");
 }

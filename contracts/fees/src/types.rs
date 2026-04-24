@@ -1,5 +1,17 @@
 // Data types for the fees contract (Issue #101 - extracted from lib.rs)
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+#[cfg_attr(
+    feature = "std",
+    derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+)]
+pub enum FeeCalculationMethod {
+    Fixed,
+    Dynamic,
+    Tiered,
+    Exponential,
+}
+
 #[derive(Debug, Clone, PartialEq, scale::Encode, scale::Decode)]
 #[cfg_attr(
     feature = "std",
@@ -11,7 +23,14 @@ pub struct FeeConfig {
     pub max_fee: u128,
     pub congestion_sensitivity: u32,
     pub demand_factor_bp: u32,
+    pub calculation_method: FeeCalculationMethod,
     pub last_updated: u64,
+}
+
+pub struct FeeContext {
+    pub congestion_index: u32,
+    pub demand_factor_bp: u32,
+    pub operation: FeeOperation,
 }
 
 #[derive(Debug, Clone, scale::Encode, scale::Decode)]

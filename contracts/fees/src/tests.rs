@@ -43,4 +43,46 @@ mod tests {
         assert!(!est.recommendation.is_empty());
         assert!(!est.congestion_level.is_empty());
     }
+
+    #[ink::test]
+    fn test_fixed_fee_strategy() {
+        let mut contract = FeeManager::new(1000, 100, 100_000);
+        let mut config = contract.default_config();
+        config.calculation_method = FeeCalculationMethod::Fixed;
+        config.base_fee = 2000;
+        
+        assert!(contract.set_operation_config(FeeOperation::RegisterProperty, config).is_ok());
+        
+        let fee = contract.calculate_fee(FeeOperation::RegisterProperty);
+        assert_eq!(fee, 2000);
+    }
+
+    #[ink::test]
+    fn test_tiered_fee_strategy() {
+        let mut contract = FeeManager::new(1000, 100, 100_000);
+        let mut config = contract.default_config();
+        config.calculation_method = FeeCalculationMethod::Tiered;
+        config.base_fee = 1000;
+        
+        assert!(contract.set_operation_config(FeeOperation::RegisterProperty, config).is_ok());
+        
+        // Tiered for RegisterProperty is 2x base_fee (20000 BP)
+        let fee = contract.calculate_fee(FeeOperation::RegisterProperty);
+        assert_eq!(fee, 2000);
+    }
+
+    #[ink::test]
+    fn test_exponential_fee_strategy() {
+        let mut contract = FeeManager::new(1000, 100, 100_000);
+        let mut config = contract.default_config();
+        config.calculation_method = FeeCalculationMethod::Exponential;
+        config.base_fee = 1000;
+        config.congestion_sensitivity = 100;
+        
+        assert!(contract.set_operation_config(FeeOperation::RegisterProperty, config).is_ok());
+        
+        // With 0 congestion, fee should be base_fee
+        let fee = contract.calculate_fee(FeeOperation::RegisterProperty);
+        assert_eq!(fee, 1000);
+    }
 }

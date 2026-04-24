@@ -57,11 +57,13 @@ export class PropChainClient {
   private _escrow: EscrowClient | null = null;
   private _oracle: OracleClient | null = null;
   private readonly _addresses: ContractAddresses;
+  private readonly _options: ClientOptions;
   private _connected: boolean = true;
 
-  private constructor(api: ApiPromise, addresses: ContractAddresses) {
+  private constructor(api: ApiPromise, addresses: ContractAddresses, options?: ClientOptions) {
     this._api = api;
     this._addresses = addresses;
+    this._options = options ?? {};
   }
 
   // ==========================================================================
@@ -99,7 +101,7 @@ export class PropChainClient {
           )
         : await createApi(wsEndpoint, options?.types as Record<string, unknown> | undefined);
 
-      const client = new PropChainClient(api, addresses);
+      const client = new PropChainClient(api, addresses, options);
 
       // Set up disconnect handler
       api.on('disconnected', () => {
@@ -152,6 +154,7 @@ export class PropChainClient {
         this._api,
         this._addresses.propertyRegistry,
         abi,
+        this._options,
       );
     }
     return this._propertyRegistry;
@@ -174,6 +177,7 @@ export class PropChainClient {
         this._api,
         this._addresses.propertyToken,
         abi,
+        this._options,
       );
     }
     return this._propertyToken;
@@ -211,6 +215,7 @@ export class PropChainClient {
         this._api,
         this._addresses.oracle,
         abi,
+        this._options,
       );
     }
     return this._oracle;

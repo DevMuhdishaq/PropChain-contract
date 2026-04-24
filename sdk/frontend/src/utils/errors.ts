@@ -108,6 +108,22 @@ export class TransactionError extends Error {
   }
 }
 
+/**
+ * Error thrown when gas estimation fails.
+ */
+export class GasEstimationError extends Error {
+  public readonly method: string;
+
+  constructor(method: string, cause?: Error) {
+    super(`Failed to estimate gas for method: ${method}`);
+    this.name = 'GasEstimationError';
+    this.method = method;
+    if (cause) {
+      Object.defineProperty(this, 'cause', { value: cause });
+    }
+  }
+}
+
 // ============================================================================
 // Error Decoding
 // ============================================================================

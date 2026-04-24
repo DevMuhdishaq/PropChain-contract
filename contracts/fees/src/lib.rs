@@ -25,6 +25,7 @@ mod propchain_fees {
 
     include!("types.rs");
     include!("errors.rs");
+    include!("strategies.rs");
 
     #[ink(storage)]
     pub struct FeeManager {
@@ -114,28 +115,6 @@ mod propchain_fees {
         timestamp: u64,
     }
 
-    /// Dynamic fee calculation: base * (1 + congestion_factor + demand_factor)
-    fn compute_dynamic_fee(
-        config: &FeeConfig,
-        congestion_index: u32,
-        demand_factor_bp: u32,
-    ) -> u128 {
-        // Congestion multiplier: 0-100 -> 0% to (MAX_CONGESTION_MULTIPLIER-100)%
-        let congestion_bp = (congestion_index as u128)
-            .saturating_mul(config.congestion_sensitivity as u128)
-            .saturating_mul((MAX_CONGESTION_MULTIPLIER - 100) as u128)
-            / 10_000;
-        let demand_bp = demand_factor_bp.min(5000); // Cap demand at 50%
-        let total_multiplier_bp = 10_000u128
-            .saturating_add(congestion_bp)
-            .saturating_add(demand_bp as u128);
-        let fee = config
-            .base_fee
-            .saturating_mul(total_multiplier_bp)
-            .saturating_div(BASIS_POINTS);
-        fee.clamp(config.min_fee, config.max_fee)
-    }
-
     impl FeeManager {
         #[ink(constructor)]
         pub fn new(base_fee: u128, min_fee: u128, max_fee: u128) -> Self {
@@ -147,6 +126,7 @@ mod propchain_fees {
                 max_fee,
                 congestion_sensitivity: 80,
                 demand_factor_bp: 500,
+                calculation_method: FeeCalculationMethod::Dynamic,
                 last_updated: timestamp,
             };
             Self {
@@ -208,13 +188,16 @@ mod propchain_fees {
 
         // ========== Dynamic fee calculation ==========
 
-        /// Calculate dynamic fee for an operation (read-only)
+        /// Calculate fee for an operation using configured strategy
         #[ink(message)]
         pub fn calculate_fee(&self, operation: FeeOperation) -> u128 {
             let config = self.get_config(operation);
-            let congestion = self.congestion_index();
-            let demand_bp = self.demand_factor_bp();
-            compute_dynamic_fee(&config, congestion, demand_bp)
+            let context = FeeContext {
+                congestion_index: self.congestion_index(),
+                demand_factor_bp: self.demand_factor_bp(),
+                operation,
+            };
+            FeeCalculator::calculate(&config, &context)
         }
 
         /// Record that a fee was collected (called by registry or self after charging)
@@ -535,7 +518,12 @@ mod propchain_fees {
             let config = self.get_config(operation);
             let congestion = self.congestion_index();
             let demand_bp = self.demand_factor_bp();
-            let estimated = compute_dynamic_fee(&config, congestion, demand_bp);
+            let context = FeeContext {
+                congestion_index: congestion,
+                demand_factor_bp: demand_bp,
+                operation,
+            };
+            let estimated = FeeCalculator::calculate(&config, &context);
             let congestion_level = if congestion < 33 {
                 "low"
             } else if congestion < 66 {
