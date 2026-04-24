@@ -1,8 +1,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(unexpected_cfgs)]
 
-use ink::prelude::string::String;
-use ink::prelude::vec::Vec;
+use ink::prelude::{string::String, vec::Vec};
 use ink::storage::Mapping;
 use propchain_traits::*;
 
@@ -73,6 +72,50 @@ mod dex {
     }
 
     #[ink(event)]
+    pub struct TradingCompetitionCreated {
+        #[ink(topic)]
+        pub competition_id: u64,
+        pub pair_id: Option<u64>,
+        pub title: String,
+        pub reward_amount: u128,
+    }
+
+    #[ink(event)]
+    pub struct CompetitionScoreUpdated {
+        #[ink(topic)]
+        pub competition_id: u64,
+        #[ink(topic)]
+        pub trader: AccountId,
+        pub score: u128,
+    }
+
+    #[ink(event)]
+    pub struct CompetitionRewardClaimed {
+        #[ink(topic)]
+        pub competition_id: u64,
+        #[ink(topic)]
+        pub trader: AccountId,
+        pub reward_amount: u128,
+    }
+
+    #[derive(
+        Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct TradingCompetition {
+        pub competition_id: u64,
+        pub pair_id: Option<u64>,
+        pub title: String,
+        pub reward_amount: u128,
+        pub start_block: u64,
+        pub end_block: u64,
+        pub min_trade_volume: u128,
+        pub top_n: u32,
+        pub reward_token_symbol: String,
+        pub active: bool,
+    }
+
+    #[ink(event)]
     pub struct AdminActionScheduled {
         #[ink(topic)]
         pub action_id: u64,
@@ -117,6 +160,11 @@ mod dex {
         votes_cast: Mapping<(u64, AccountId), bool>,
         liquidity_mining: LiquidityMiningCampaign,
         last_reward_block: Mapping<u64, u64>,
+        trade_competition_counter: u64,
+        trading_competitions: Mapping<u64, TradingCompetition>,
+        competition_scores: Mapping<(u64, AccountId), u128>,
+        competition_participants: Mapping<u64, Vec<AccountId>>,
+        competition_claimed: Mapping<(u64, AccountId), bool>,
         admin_timelock_delay: u64,
         pending_admin_actions: Mapping<u64, PendingAdminAction>,
         pending_admin_action_counter: u64,
@@ -162,6 +210,11 @@ mod dex {
                     reward_token_symbol: String::from("GOV"),
                 },
                 last_reward_block: Mapping::default(),
+                trade_competition_counter: 0,
+                trading_competitions: Mapping::default(),
+                competition_scores: Mapping::default(),
+                competition_participants: Mapping::default(),
+                competition_claimed: Mapping::default(),
                 admin_timelock_delay: 0,
                 pending_admin_actions: Mapping::default(),
                 pending_admin_action_counter: 0,
@@ -680,6 +733,719 @@ mod dex {
                 reward_token_symbol,
             );
             Ok(())
+        }
+
+        #[ink(message)]
+        pub fn create_trading_competition(
+            &mut self,
+            pair_id: Option<u64>,
+            title: String,
+            reward_amount: u128,
+            start_block: u64,
+            end_block: u64,
+            min_trade_volume: u128,
+            top_n: u32,
+            reward_token_symbol: String,
+        ) -> Result<u64, Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            if title.is_empty() || start_block >= end_block || reward_amount == 0 {
+                return Err(Error::InvalidRequest);
+            }
+            self.trade_competition_counter = self.trade_competition_counter.saturating_add(1);
+            let competition_id = self.trade_competition_counter;
+            let competition = TradingCompetition {
+                competition_id,
+                pair_id,
+                title: title.clone(),
+                reward_amount,
+                start_block,
+                end_block,
+                min_trade_volume,
+                top_n,
+                reward_token_symbol,
+                active: true,
+            };
+            self.trading_competitions
+                .insert(competition_id, &competition);
+            self.competition_participants
+                .insert(competition_id, &Vec::<AccountId>::new());
+            self.env().emit_event(TradingCompetitionCreated {
+                competition_id,
+                pair_id,
+                title,
+                reward_amount,
+            });
+            Ok(competition_id)
+        }
+
+        #[ink(message)]
+        pub fn get_trading_competition(&self, competition_id: u64) -> Option<TradingCompetition> {
+            self.trading_competitions.get(competition_id)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_score(&self, competition_id: u64, account: AccountId) -> u128 {
+            self.competition_scores
+                .get((competition_id, account))
+                .unwrap_or(0)
+        }
+
+        #[ink(message)]
+        pub fn claim_competition_reward(&mut self, competition_id: u64) -> Result<u128, Error> {
+            let competition = self
+                .trading_competitions
+                .get(competition_id)
+                .ok_or(Error::InvalidRequest)?;
+            let current_block = u64::from(self.env().block_number());
+            if current_block <= competition.end_block {
+                return Err(Error::InvalidRequest);
+            }
+            let caller = self.env().caller();
+            if self
+                .competition_claimed
+                .get((competition_id, caller))
+                .unwrap_or(false)
+            {
+                return Err(Error::InvalidRequest);
+            }
+            let score = self
+                .competition_scores
+                .get((competition_id, caller))
+                .unwrap_or(0);
+            if score == 0 {
+                return Err(Error::InvalidRequest);
+            }
+
+            let participants = self
+                .competition_participants
+                .get(competition_id)
+                .unwrap_or_else(Vec::new);
+            let mut total_score = 0u128;
+            for participant in participants.iter() {
+                total_score = total_score.saturating_add(
+                    self.competition_scores
+                        .get((competition_id, *participant))
+                        .unwrap_or(0),
+                );
+            }
+            if total_score == 0 {
+                return Err(Error::InvalidRequest);
+            }
+
+            let reward = competition
+                .reward_amount
+                .saturating_mul(score)
+                .checked_div(total_score)
+                .unwrap_or(0);
+
+            if reward == 0 {
+                return Err(Error::InvalidRequest);
+            }
+
+            self.competition_claimed
+                .insert((competition_id, caller), &true);
+            let balance = self.governance_balances.get(caller).unwrap_or(0);
+            self.governance_balances
+                .insert(caller, &balance.saturating_add(reward));
+            self.governance_config.total_supply =
+                self.governance_config.total_supply.saturating_add(reward);
+            self.env().emit_event(CompetitionRewardClaimed {
+                competition_id,
+                trader: caller,
+                reward_amount: reward,
+            });
+            Ok(reward)
+        }
+
+        fn update_trade_competition_score(
+            &mut self,
+            pair_id: u64,
+            trader: AccountId,
+            volume: u128,
+        ) {
+            let current_block = u64::from(self.env().block_number());
+            for competition_id in 1..=self.trade_competition_counter {
+                if let Some(competition) = self.trading_competitions.get(competition_id) {
+                    if !competition.active
+                        || current_block < competition.start_block
+                        || current_block > competition.end_block
+                    {
+                        continue;
+                    }
+                    if let Some(id) = competition.pair_id {
+                        if id != pair_id {
+                            continue;
+                        }
+                    }
+                    if volume < competition.min_trade_volume {
+                        continue;
+                    }
+
+                    let key = (competition_id, trader);
+                    let prev_score = self.competition_scores.get(key).unwrap_or(0);
+                    let next_score = prev_score.saturating_add(volume);
+                    self.competition_scores.insert(key, &next_score);
+
+                    let mut participants = self
+                        .competition_participants
+                        .get(competition_id)
+                        .unwrap_or_else(Vec::new);
+                    if !participants.contains(&trader) {
+                        participants.push(trader);
+                        self.competition_participants
+                            .insert(competition_id, &participants);
+                    }
+
+                    self.env().emit_event(CompetitionScoreUpdated {
+                        competition_id,
+                        trader,
+                        score: next_score,
+                    });
+                }
+            }
+        }
+
+        #[ink(message)]
+        pub fn list_competition_participants(&self, competition_id: u64) -> Vec<AccountId> {
+            self.competition_participants
+                .get(competition_id)
+                .unwrap_or_else(Vec::new)
+        }
+
+        #[ink(message)]
+        pub fn get_active_competitions(&self) -> Vec<TradingCompetition> {
+            let current_block = u64::from(self.env().block_number());
+            let mut active = Vec::new();
+            for competition_id in 1..=self.trade_competition_counter {
+                if let Some(competition) = self.trading_competitions.get(competition_id) {
+                    if competition.active
+                        && current_block >= competition.start_block
+                        && current_block <= competition.end_block
+                    {
+                        active.push(competition);
+                    }
+                }
+            }
+            active
+        }
+
+        #[ink(message)]
+        pub fn get_competition_leaderboard(&self, competition_id: u64) -> Vec<(AccountId, u128)> {
+            let mut leaderboard = Vec::new();
+            let participants = self
+                .competition_participants
+                .get(competition_id)
+                .unwrap_or_else(Vec::new);
+            for participant in participants.iter() {
+                let score = self
+                    .competition_scores
+                    .get((competition_id, *participant))
+                    .unwrap_or(0);
+                if score > 0 {
+                    leaderboard.push((*participant, score));
+                }
+            }
+            leaderboard
+        }
+
+        #[ink(message)]
+        pub fn deactivate_competition(&mut self, competition_id: u64) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            let mut competition = self
+                .trading_competitions
+                .get(competition_id)
+                .ok_or(Error::InvalidRequest)?;
+            competition.active = false;
+            self.trading_competitions
+                .insert(competition_id, &competition);
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn activate_competition(&mut self, competition_id: u64) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            let mut competition = self
+                .trading_competitions
+                .get(competition_id)
+                .ok_or(Error::InvalidRequest)?;
+            competition.active = true;
+            self.trading_competitions
+                .insert(competition_id, &competition);
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn complete_competition(&mut self, competition_id: u64) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            let mut competition = self
+                .trading_competitions
+                .get(competition_id)
+                .ok_or(Error::InvalidRequest)?;
+            competition.active = false;
+            competition.end_block = u64::from(self.env().block_number());
+            self.trading_competitions
+                .insert(competition_id, &competition);
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn get_competition_reward_token_symbol(&self, competition_id: u64) -> Option<String> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| competition.reward_token_symbol)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_reward_amount(&self, competition_id: u64) -> Option<u128> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| competition.reward_amount)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_timer(&self, competition_id: u64) -> Option<(u64, u64)> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| (competition.start_block, competition.end_block))
+        }
+
+        #[ink(message)]
+        pub fn is_competition_active(&self, competition_id: u64) -> bool {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| competition.active)
+                .unwrap_or(false)
+        }
+
+        #[ink(message)]
+        pub fn set_competition_minimum_volume(
+            &mut self,
+            competition_id: u64,
+            min_trade_volume: u128,
+        ) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            let mut competition = self
+                .trading_competitions
+                .get(competition_id)
+                .ok_or(Error::InvalidRequest)?;
+            competition.min_trade_volume = min_trade_volume;
+            self.trading_competitions
+                .insert(competition_id, &competition);
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn set_competition_reward_amount(
+            &mut self,
+            competition_id: u64,
+            reward_amount: u128,
+        ) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            let mut competition = self
+                .trading_competitions
+                .get(competition_id)
+                .ok_or(Error::InvalidRequest)?;
+            competition.reward_amount = reward_amount;
+            self.trading_competitions
+                .insert(competition_id, &competition);
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn get_competition_participant_score(
+            &self,
+            competition_id: u64,
+            trader: AccountId,
+        ) -> u128 {
+            self.competition_scores
+                .get((competition_id, trader))
+                .unwrap_or(0)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_participants_count(&self, competition_id: u64) -> u64 {
+            self.competition_participants
+                .get(competition_id)
+                .map(|participants| participants.len() as u64)
+                .unwrap_or(0)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_end_block(&self, competition_id: u64) -> Option<u64> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| competition.end_block)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_start_block(&self, competition_id: u64) -> Option<u64> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| competition.start_block)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_details(&self, competition_id: u64) -> Option<TradingCompetition> {
+            self.trading_competitions.get(competition_id)
+        }
+
+        #[ink(message)]
+        pub fn is_competition_reward_claimed(
+            &self,
+            competition_id: u64,
+            trader: AccountId,
+        ) -> bool {
+            self.competition_claimed
+                .get((competition_id, trader))
+                .unwrap_or(false)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_total_players(&self, competition_id: u64) -> u64 {
+            self.get_competition_participants_count(competition_id)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_top_n(&self, competition_id: u64) -> Option<u32> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| competition.top_n)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_reward_symbol(&self, competition_id: u64) -> Option<String> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| competition.reward_token_symbol)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_title(&self, competition_id: u64) -> Option<String> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| competition.title)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_reward_info(&self, competition_id: u64) -> Option<(u128, String)> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| (competition.reward_amount, competition.reward_token_symbol))
+        }
+
+        #[ink(message)]
+        pub fn get_all_competitions(&self) -> Vec<TradingCompetition> {
+            let mut competitions = Vec::new();
+            for competition_id in 1..=self.trade_competition_counter {
+                if let Some(comp) = self.trading_competitions.get(competition_id) {
+                    competitions.push(comp);
+                }
+            }
+            competitions
+        }
+
+        #[ink(message)]
+        pub fn is_trade_competition_running(&self, competition_id: u64) -> bool {
+            self.get_competition_end_block(competition_id)
+                .map(|end| u64::from(self.env().block_number()) <= end)
+                .unwrap_or(false)
+        }
+
+        #[ink(message)]
+        pub fn refresh_competition_state(&mut self, competition_id: u64) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            let mut competition = self
+                .trading_competitions
+                .get(competition_id)
+                .ok_or(Error::InvalidRequest)?;
+            let current_block = u64::from(self.env().block_number());
+            competition.active =
+                current_block >= competition.start_block && current_block <= competition.end_block;
+            self.trading_competitions
+                .insert(competition_id, &competition);
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn tally_competition_leaderboard(&self, competition_id: u64) -> Vec<(AccountId, u128)> {
+            self.get_competition_leaderboard(competition_id)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_status(&self, competition_id: u64) -> Option<(bool, u64, u64)> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| {
+                    (
+                        competition.active,
+                        competition.start_block,
+                        competition.end_block,
+                    )
+                })
+        }
+
+        #[ink(message)]
+        pub fn get_competition_reward_state(&self, competition_id: u64) -> Option<bool> {
+            Some(self.is_competition_reward_claimed(competition_id, self.env().caller()))
+        }
+
+        #[ink(message)]
+        pub fn get_reward_share_for_trader(
+            &self,
+            competition_id: u64,
+            trader: AccountId,
+        ) -> Option<u128> {
+            let competition = self.trading_competitions.get(competition_id)?;
+            let score = self
+                .competition_scores
+                .get((competition_id, trader))
+                .unwrap_or(0);
+            if score == 0 {
+                return None;
+            }
+            let participants = self
+                .competition_participants
+                .get(competition_id)
+                .unwrap_or_else(Vec::new);
+            let mut total_score = 0u128;
+            for participant in participants {
+                total_score = total_score.saturating_add(
+                    self.competition_scores
+                        .get((competition_id, participant))
+                        .unwrap_or(0),
+                );
+            }
+            if total_score == 0 {
+                return None;
+            }
+            Some(
+                competition
+                    .reward_amount
+                    .saturating_mul(score)
+                    .checked_div(total_score)
+                    .unwrap_or(0),
+            )
+        }
+
+        #[ink(message)]
+        pub fn get_competition_total_score(&self, competition_id: u64) -> u128 {
+            let participants = self
+                .competition_participants
+                .get(competition_id)
+                .unwrap_or_else(Vec::new);
+            let mut total_score = 0u128;
+            for participant in participants {
+                total_score = total_score.saturating_add(
+                    self.competition_scores
+                        .get((competition_id, participant))
+                        .unwrap_or(0),
+                );
+            }
+            total_score
+        }
+
+        #[ink(message)]
+        pub fn get_competition_count(&self) -> u64 {
+            self.trade_competition_counter
+        }
+
+        #[ink(message)]
+        pub fn get_competition_participant_reward_status(
+            &self,
+            competition_id: u64,
+            trader: AccountId,
+        ) -> bool {
+            self.is_competition_reward_claimed(competition_id, trader)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_reward_balance(&self, trader: AccountId) -> u128 {
+            self.governance_balances.get(trader).unwrap_or(0)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_settings(&self, competition_id: u64) -> Option<(u32, u128)> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| (competition.top_n, competition.min_trade_volume))
+        }
+
+        #[ink(message)]
+        pub fn get_competition_details_by_title(&self, title: String) -> Vec<TradingCompetition> {
+            let mut results = Vec::new();
+            for competition_id in 1..=self.trade_competition_counter {
+                if let Some(comp) = self.trading_competitions.get(competition_id) {
+                    if comp.title == title {
+                        results.push(comp);
+                    }
+                }
+            }
+            results
+        }
+
+        #[ink(message)]
+        pub fn get_competition_rewards_summary(&self, competition_id: u64) -> Option<(u128, bool)> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| (competition.reward_amount, competition.active))
+        }
+
+        #[ink(message)]
+        pub fn get_competition_status_summary(
+            &self,
+            competition_id: u64,
+        ) -> Option<(bool, u64, u64, u128)> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| {
+                    (
+                        competition.active,
+                        competition.start_block,
+                        competition.end_block,
+                        competition.reward_amount,
+                    )
+                })
+        }
+
+        #[ink(message)]
+        pub fn get_competition_report(
+            &self,
+            competition_id: u64,
+        ) -> Option<(String, u128, u64, u64)> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| {
+                    (
+                        competition.title,
+                        competition.reward_amount,
+                        competition.start_block,
+                        competition.end_block,
+                    )
+                })
+        }
+
+        #[ink(message)]
+        pub fn get_competition_metadata(&self, competition_id: u64) -> Option<String> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| competition.title)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_summary_for_user(
+            &self,
+            competition_id: u64,
+            trader: AccountId,
+        ) -> Option<(u128, bool)> {
+            let score = self.get_competition_score(competition_id, trader);
+            let claimed = self.is_competition_reward_claimed(competition_id, trader);
+            if score == 0 {
+                None
+            } else {
+                Some((score, claimed))
+            }
+        }
+
+        #[ink(message)]
+        pub fn get_competition_summary_all(&self) -> Vec<(u64, bool, u128)> {
+            let mut list = Vec::new();
+            for competition_id in 1..=self.trade_competition_counter {
+                if let Some(comp) = self.trading_competitions.get(competition_id) {
+                    list.push((competition_id, comp.active, comp.reward_amount));
+                }
+            }
+            list
+        }
+
+        #[ink(message)]
+        pub fn get_competition_final_scores(&self, competition_id: u64) -> Vec<(AccountId, u128)> {
+            self.get_competition_leaderboard(competition_id)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_trade_volume_goal(&self, competition_id: u64) -> Option<u128> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| competition.min_trade_volume)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_reward_distribution(
+            &self,
+            competition_id: u64,
+        ) -> Option<(u128, u32)> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| (competition.reward_amount, competition.top_n))
+        }
+
+        #[ink(message)]
+        pub fn get_competition_details_for_dashboard(
+            &self,
+            competition_id: u64,
+        ) -> Option<(String, bool, u128)> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| {
+                    (
+                        competition.title,
+                        competition.active,
+                        competition.reward_amount,
+                    )
+                })
+        }
+
+        #[ink(message)]
+        pub fn get_competition_history(&self) -> Vec<TradingCompetition> {
+            self.get_all_competitions()
+        }
+
+        #[ink(message)]
+        pub fn get_competition_description(&self, competition_id: u64) -> Option<String> {
+            self.trading_competitions
+                .get(competition_id)
+                .map(|competition| competition.title)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_rank(&self, competition_id: u64, trader: AccountId) -> Option<u64> {
+            let mut leaderboard = self.get_competition_leaderboard(competition_id);
+            leaderboard.sort_by(|a, b| b.1.cmp(&a.1));
+            for (idx, (account, _score)) in leaderboard.iter().enumerate() {
+                if *account == trader {
+                    return Some((idx + 1) as u64);
+                }
+            }
+            None
+        }
+
+        #[ink(message)]
+        pub fn get_competition_top_scores(&self, competition_id: u64) -> Vec<(AccountId, u128)> {
+            self.get_competition_leaderboard(competition_id)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_active_status(&self, competition_id: u64) -> bool {
+            self.is_competition_active(competition_id)
+        }
+
+        #[ink(message)]
+        pub fn get_competition_admin(&self, _competition_id: u64) -> AccountId {
+            self.admin
         }
 
         #[ink(message)]
@@ -1495,6 +2261,7 @@ mod dex {
                 amount_out,
             });
 
+            self.update_trade_competition_score(pair_id, caller, amount_out);
             // After swap, check for executable limit orders
             self.process_executable_limit_orders(pair_id)?;
 

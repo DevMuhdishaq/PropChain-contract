@@ -190,3 +190,22 @@ pub struct VestingSchedule {
     pub vesting_duration: u64,
 }
 
+/// Snapshot for governance voting (Issue #194)
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct Snapshot {
+    pub id: u64,
+    pub token_id: TokenId,
+    pub created_at: u64,
+    pub total_supply_at_snapshot: u128,
+    pub description: String, // Optional description of why snapshot was taken
+}
+

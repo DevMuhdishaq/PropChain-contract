@@ -11,6 +11,7 @@ This guide provides developers with complete, well-documented APIs for integrati
 ### 1. Find What You Need
 
 **By Use Case**:
+- **Interactive API Playground**: See [API Playground](./API_PLAYGROUND.md) for direct local node contract calls in the docs
 - **Register Property**: See [`register_property`](#register_property)
 - **Transfer Ownership**: See [`transfer_property`](#transfer_property)
 - **Check Compliance**: See [`check_account_compliance`](#check_account_compliance)
