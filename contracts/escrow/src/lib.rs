@@ -411,7 +411,12 @@ mod propchain_escrow {
                 let tier = self.classify_transfer_tier(escrow.deposited_amount);
                 if !matches!(tier, TransferApprovalTier::Standard) {
                     // Only create a new request if there isn't one already pending.
-                    if self.escrow_active_large_transfer.get(&escrow_id).unwrap_or(0) == 0 {
+                    if self
+                        .escrow_active_large_transfer
+                        .get(&escrow_id)
+                        .unwrap_or(0)
+                        == 0
+                    {
                         self.create_large_transfer_request(
                             escrow_id,
                             ApprovalType::Release,
@@ -481,7 +486,12 @@ mod propchain_escrow {
                 // ── Large-transfer gate ──────────────────────────────────────
                 let tier = self.classify_transfer_tier(escrow.deposited_amount);
                 if !matches!(tier, TransferApprovalTier::Standard) {
-                    if self.escrow_active_large_transfer.get(&escrow_id).unwrap_or(0) == 0 {
+                    if self
+                        .escrow_active_large_transfer
+                        .get(&escrow_id)
+                        .unwrap_or(0)
+                        == 0
+                    {
                         self.create_large_transfer_request(
                             escrow_id,
                             ApprovalType::Refund,
@@ -999,8 +1009,7 @@ mod propchain_escrow {
                 request.status = LargeTransferStatus::Expired;
                 self.large_transfer_requests.insert(&request_id, &request);
                 // Clear the active index so a new request can be created
-                self.escrow_active_large_transfer
-                    .remove(&request.escrow_id);
+                self.escrow_active_large_transfer.remove(&request.escrow_id);
                 return Err(Error::ApprovalRequestExpired);
             }
 
@@ -1085,8 +1094,7 @@ mod propchain_escrow {
                     let mut expired = request.clone();
                     expired.status = LargeTransferStatus::Expired;
                     self.large_transfer_requests.insert(&request_id, &expired);
-                    self.escrow_active_large_transfer
-                        .remove(&request.escrow_id);
+                    self.escrow_active_large_transfer.remove(&request.escrow_id);
                     return Err(Error::ApprovalRequestExpired);
                 }
 
@@ -1129,8 +1137,7 @@ mod propchain_escrow {
                     .insert(&request_id, &executed_request);
 
                 // Clear the active index
-                self.escrow_active_large_transfer
-                    .remove(&request.escrow_id);
+                self.escrow_active_large_transfer.remove(&request.escrow_id);
 
                 self.add_audit_entry(
                     request.escrow_id,
@@ -1184,8 +1191,7 @@ mod propchain_escrow {
             self.large_transfer_requests.insert(&request_id, &request);
 
             // Clear the active index so a new request can be created
-            self.escrow_active_large_transfer
-                .remove(&request.escrow_id);
+            self.escrow_active_large_transfer.remove(&request.escrow_id);
 
             self.add_audit_entry(
                 request.escrow_id,
@@ -1232,10 +1238,7 @@ mod propchain_escrow {
 
         /// Get a large-transfer approval request by ID.
         #[ink(message)]
-        pub fn get_large_transfer_request(
-            &self,
-            request_id: u64,
-        ) -> Option<LargeTransferRequest> {
+        pub fn get_large_transfer_request(&self, request_id: u64) -> Option<LargeTransferRequest> {
             self.large_transfer_requests.get(&request_id)
         }
 
@@ -1493,9 +1496,8 @@ mod propchain_escrow {
             self.large_transfer_request_count += 1;
             let request_id = self.large_transfer_request_count;
             let current_block = u64::from(self.env().block_number());
-            let expires_at_block = current_block.saturating_add(
-                propchain_traits::constants::LARGE_TRANSFER_APPROVAL_EXPIRY_BLOCKS,
-            );
+            let expires_at_block = current_block
+                .saturating_add(propchain_traits::constants::LARGE_TRANSFER_APPROVAL_EXPIRY_BLOCKS);
 
             let request = LargeTransferRequest {
                 request_id,
