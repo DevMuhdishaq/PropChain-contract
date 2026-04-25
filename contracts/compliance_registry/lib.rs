@@ -1586,11 +1586,7 @@ mod compliance_registry {
                 .insert(jurisdiction, &jurisdiction_metrics);
         }
 
-        fn update_kyc_metrics(
-            metrics: &mut KycMetrics,
-            converted_request: bool,
-            success: bool,
-        ) {
+        fn update_kyc_metrics(metrics: &mut KycMetrics, converted_request: bool, success: bool) {
             metrics.verification_attempts = metrics.verification_attempts.saturating_add(1);
 
             if success {
@@ -1608,10 +1604,8 @@ mod compliance_registry {
         }
 
         fn refresh_kyc_rates(metrics: &mut KycMetrics) {
-            metrics.conversion_rate_bips = Self::compute_rate_bips(
-                metrics.converted_requests,
-                metrics.requests_created,
-            );
+            metrics.conversion_rate_bips =
+                Self::compute_rate_bips(metrics.converted_requests, metrics.requests_created);
             metrics.verification_rate_bips = Self::compute_rate_bips(
                 metrics.successful_verifications,
                 metrics.verification_attempts,
