@@ -27,6 +27,13 @@ mod propchain_lending {
         InvalidParameters,
         ProposalNotFound,
         InsufficientVotes,
+        ReentrantCall,
+    }
+
+    impl From<propchain_traits::ReentrancyError> for LendingError {
+        fn from(_: propchain_traits::ReentrancyError) -> Self {
+            LendingError::ReentrantCall
+        }
     }
 
     #[derive(
@@ -115,6 +122,7 @@ mod propchain_lending {
         reward_per_block: u128,
         proposals: Mapping<u64, Proposal>,
         proposal_count: u64,
+        reentrancy_guard: propchain_traits::ReentrancyGuard,
     }
 
     #[ink(event)]
@@ -174,6 +182,7 @@ mod propchain_lending {
                 reward_per_block: 100,
                 proposals: Mapping::default(),
                 proposal_count: 0,
+                reentrancy_guard: propchain_traits::ReentrancyGuard::new(),
             }
         }
 
@@ -235,21 +244,25 @@ mod propchain_lending {
 
         #[ink(message)]
         pub fn deposit(&mut self, pool_id: u64, amount: u128) -> Result<(), LendingError> {
-            let mut pool = self.pools.get(pool_id).ok_or(LendingError::PoolNotFound)?;
-            pool.total_deposits += amount;
-            self.pools.insert(pool_id, &pool);
-            Ok(())
+            propchain_traits::non_reentrant!(self, {
+                let mut pool = self.pools.get(pool_id).ok_or(LendingError::PoolNotFound)?;
+                pool.total_deposits += amount;
+                self.pools.insert(pool_id, &pool);
+                Ok(())
+            })
         }
 
         #[ink(message)]
         pub fn borrow(&mut self, pool_id: u64, amount: u128) -> Result<(), LendingError> {
-            let mut pool = self.pools.get(pool_id).ok_or(LendingError::PoolNotFound)?;
-            if pool.total_deposits < pool.total_borrows + amount {
-                return Err(LendingError::InsufficientLiquidity);
-            }
-            pool.total_borrows += amount;
-            self.pools.insert(pool_id, &pool);
-            Ok(())
+            propchain_traits::non_reentrant!(self, {
+                let mut pool = self.pools.get(pool_id).ok_or(LendingError::PoolNotFound)?;
+                if pool.total_deposits < pool.total_borrows + amount {
+                    return Err(LendingError::InsufficientLiquidity);
+                }
+                pool.total_borrows += amount;
+                self.pools.insert(pool_id, &pool);
+                Ok(())
+            })
         }
 
         #[ink(message)]
