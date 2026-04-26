@@ -6063,7 +6063,6 @@ version = "1.0.0"
 dependencies = [
  "ink 5.1.1",
  "parity-scale-codec",
- "propchain-contracts",
  "propchain-traits",
  "scale-info",
 ]
