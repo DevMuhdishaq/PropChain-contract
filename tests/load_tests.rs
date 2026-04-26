@@ -28,11 +28,11 @@ use ink::env::test::{default_accounts, set_caller};
 use ink_env::DefaultEnvironment;
 use propchain_contracts::propchain_contracts::PropertyRegistry as PropertyRegistryContract;
 use propchain_traits::*;
+use std::collections::HashMap;
 use std::fs;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::collections::HashMap;
 
 /// Test configuration for load tests
 #[derive(Debug, Clone)]
