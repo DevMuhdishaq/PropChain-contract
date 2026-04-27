@@ -28,6 +28,7 @@ use ink::env::test::{default_accounts, set_caller};
 use ink_env::DefaultEnvironment;
 use propchain_contracts::propchain_contracts::PropertyRegistry as PropertyRegistryContract;
 use propchain_traits::*;
+use std::collections::HashMap;
 use std::fs;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -209,6 +210,17 @@ pub struct LoadTestMetrics {
     pub ops_per_second: Arc<Mutex<f64>>,
     /// Peak memory usage (if available)
     pub peak_memory_mb: Arc<Mutex<f64>>,
+    /// Per-operation response time tracking
+    pub operation_metrics: Arc<Mutex<HashMap<String, Vec<u128>>>>,
+}
+
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct HotspotReport {
+    operation: String,
+    calls: usize,
+    avg_time: u128,
 }
 
 impl LoadTestMetrics {
@@ -233,6 +245,15 @@ impl LoadTestMetrics {
     pub fn record_failure(&self) {
         *self.total_operations.lock().unwrap() += 1;
         *self.failed_operations.lock().unwrap() += 1;
+    }
+
+    /// Record per-operation response time
+    pub fn record_operation(&self, operation: &str, response_time_ms: u128) {
+        let mut ops = self.operation_metrics.lock().unwrap();
+
+        ops.entry(operation.to_string())
+            .or_insert_with(Vec::new)
+            .push(response_time_ms);
     }
 
     /// Update the recorded peak memory usage.
@@ -302,6 +323,45 @@ impl LoadTestMetrics {
             *self.peak_memory_mb.lock().unwrap()
         );
         println!("{}", "=".repeat(80));
+
+        println!("\n Hotspot Analysis:");
+
+        let ops = self.operation_metrics.lock().unwrap();
+
+        for (op, times) in ops.iter() {
+            let total: u128 = times.iter().sum();
+            let avg = total / times.len() as u128;
+
+            println!(
+                "Operation: {}, Calls: {}, Avg Time: {} ms",
+                op,
+                times.len(),
+                avg
+            );
+
+            if avg > 50 {
+                println!("⚠️ Potential bottleneck detected in {}", op);
+            }
+        }
+
+        let mut report = Vec::new();
+
+        for (op, times) in ops.iter() {
+            let total: u128 = times.iter().sum();
+            let avg = total / times.len() as u128;
+
+            report.push(HotspotReport {
+                operation: op.clone(),
+                calls: times.len(),
+                avg_time: avg,
+            });
+        }
+
+        std::fs::write(
+            "load_test_hotspots.json",
+            serde_json::to_string_pretty(&report).unwrap(),
+        )
+        .unwrap();
     }
 }
 
@@ -337,9 +397,10 @@ pub fn simulate_user_registration(
     let mut registry = PropertyRegistryContract::new();
 
     for i in 0..num_properties {
+        let metadata = generate_property_metadata(user_id, i);
+
         let start = Instant::now();
 
-        let metadata = generate_property_metadata(user_id, i);
         let result = registry.register_property(metadata);
 
         let mut elapsed = start.elapsed().as_millis() as u64;
@@ -350,7 +411,10 @@ pub fn simulate_user_registration(
         elapsed += network_delay;
 
         match result {
-            Ok(_) => metrics.record_success(elapsed as u128),
+            Ok(_) => {
+                metrics.record_success(elapsed);
+                metrics.record_operation("register_property", elapsed);
+            }
             Err(_) => metrics.record_failure(),
         }
 
@@ -388,7 +452,8 @@ pub fn simulate_user_queries(
         let _result = registry.get_property(property_id as u64);
 
         let elapsed = start.elapsed().as_millis();
-        metrics.record_success(elapsed as u128);
+        metrics.record_success(elapsed);
+        metrics.record_operation("get_property", elapsed);
 
         if config.operation_delay_ms > 0 {
             thread::sleep(Duration::from_millis(config.operation_delay_ms));
@@ -429,6 +494,7 @@ where
             max_response_time_ms: Arc::clone(&metrics.max_response_time_ms),
             ops_per_second: Arc::clone(&metrics.ops_per_second),
             peak_memory_mb: Arc::clone(&metrics.peak_memory_mb),
+            operation_metrics: Arc::clone(&metrics.operation_metrics),
         };
         let task_fn_clone = Arc::clone(&task_fn);
 
