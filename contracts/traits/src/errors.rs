@@ -292,6 +292,12 @@ pub mod escrow_codes {
     pub const ESCROW_ALREADY_FUNDED: u32 = 2012;
     pub const PARTICIPANT_NOT_FOUND: u32 = 2013;
     pub const REENTRANT_CALL: u32 = 2014;
+    // Multi-step approval error codes
+    pub const APPROVAL_REQUEST_NOT_FOUND: u32 = 2015;
+    pub const APPROVAL_REQUEST_EXPIRED: u32 = 2016;
+    pub const APPROVAL_REQUEST_ALREADY_EXECUTED: u32 = 2017;
+    pub const APPROVAL_REQUEST_CANCELLED: u32 = 2018;
+    pub const LARGE_TRANSFER_APPROVAL_REQUIRED: u32 = 2019;
 }
 
 /// Bridge error codes (3000-3999)
