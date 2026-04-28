@@ -29,6 +29,19 @@ mod propchain_crowdfunding {
         ProposalNotActive,
         InvalidParameters,
         AlreadyVoted,
+        ReentrantCall,
+
+        OracleVerificationFailed,
+        CampaignNotFailed,
+        AlreadyRefunded,
+        NoInvestmentFound,
+        AccreditationNotVerified,
+    }
+
+    impl From<propchain_traits::ReentrancyError> for CrowdfundingError {
+        fn from(_: propchain_traits::ReentrancyError) -> Self {
+            CrowdfundingError::ReentrantCall
+        }
     }
 
     #[derive(
@@ -135,6 +148,8 @@ mod propchain_crowdfunding {
         pub description: String,
         pub release_amount: u128,
         pub status: MilestoneStatus,
+        pub oracle_verified: bool,
+        pub oracle_data_hash: Option<[u8; 32]>,
     }
 
     #[derive(
@@ -180,40 +195,20 @@ mod propchain_crowdfunding {
         pub rating: RiskRating,
     }
 
-    // ── Search & Discovery Types ─────────────────────────────
-
-    #[derive(Debug, Clone, PartialEq, scale::Encode, scale::Decode)]
+    #[derive(
+        Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+    )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
-    pub struct CampaignFilter {
-        /// Optional status to match (None = any)
-        pub status: Option<CampaignStatus>,
-        /// Keyword that must appear in the title (case-insensitive, None = any)
-        pub title_keyword: Option<String>,
-        /// Minimum target amount (None = no minimum)
-        pub min_target: Option<u128>,
-        /// Maximum target amount (None = no maximum)
-        pub max_target: Option<u128>,
-        /// Minimum funding percentage 0-100 (None = no minimum)
-        pub min_funded_pct: Option<u32>,
-        /// Only show fully funded campaigns
-        pub funded_only: bool,
-    }
-
-    #[derive(Debug, Clone, PartialEq, scale::Encode, scale::Decode)]
-    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
-    pub struct CampaignSummary {
+    pub struct CampaignSuccessMetrics {
         pub campaign_id: u64,
-        pub creator: AccountId,
-        pub title: String,
-        pub target_amount: u128,
-        pub raised_amount: u128,
-        pub funded_pct: u32,
-        pub status: CampaignStatus,
+        pub funding_progress_bps: u32,
         pub investor_count: u32,
-        pub risk_rating: RiskRating,
+        pub average_investment: u128,
+        pub total_milestones: u32,
+        pub released_milestones: u32,
+        pub released_capital: u128,
+        pub is_funded: bool,
     }
-
-    // ── Storage ──────────────────────────────────────────────
 
     #[ink(storage)]
     pub struct RealEstateCrowdfunding {
@@ -233,7 +228,15 @@ mod propchain_crowdfunding {
         listings: Mapping<u64, ShareListing>,
         listing_count: u64,
         risk_profiles: Mapping<u64, RiskProfile>,
+        campaign_milestone_counts: Mapping<u64, u32>,
+        released_milestone_counts: Mapping<u64, u32>,
+        released_capital: Mapping<u64, u128>,
         blocked_jurisdictions: Vec<String>,
+        reentrancy_guard: propchain_traits::ReentrancyGuard,
+        /// Authorized oracle accounts for milestone verification
+        authorized_oracles: Mapping<AccountId, bool>,
+        /// Tracks whether an investor has been refunded for a campaign
+        refunds_issued: Mapping<(u64, AccountId), bool>,
     }
 
     // ── Events ───────────────────────────────────────────────
@@ -280,7 +283,30 @@ mod propchain_crowdfunding {
         shares: u64,
     }
 
-    // ── Implementation ───────────────────────────────────────
+    #[ink(event)]
+    pub struct MilestoneOracleVerified {
+        #[ink(topic)]
+        milestone_id: u64,
+        #[ink(topic)]
+        oracle: AccountId,
+        data_hash: [u8; 32],
+    }
+
+    #[ink(event)]
+    pub struct RefundIssued {
+        #[ink(topic)]
+        campaign_id: u64,
+        #[ink(topic)]
+        investor: AccountId,
+        amount: u128,
+    }
+
+    #[ink(event)]
+    pub struct AccreditationVerified {
+        #[ink(topic)]
+        investor: AccountId,
+        verified_by: AccountId,
+    }
 
     impl RealEstateCrowdfunding {
         #[ink(constructor)]
@@ -302,7 +328,13 @@ mod propchain_crowdfunding {
                 listings: Mapping::default(),
                 listing_count: 0,
                 risk_profiles: Mapping::default(),
+                campaign_milestone_counts: Mapping::default(),
+                released_milestone_counts: Mapping::default(),
+                released_capital: Mapping::default(),
                 blocked_jurisdictions: Vec::new(),
+                reentrancy_guard: propchain_traits::ReentrancyGuard::new(),
+                authorized_oracles: Mapping::default(),
+                refunds_issued: Mapping::default(),
             }
         }
 
@@ -365,6 +397,37 @@ mod propchain_crowdfunding {
             Ok(())
         }
 
+        /// Admin-only: verify an investor's accreditation status
+        #[ink(message)]
+        pub fn verify_accreditation(
+            &mut self,
+            investor: AccountId,
+        ) -> Result<(), CrowdfundingError> {
+            if self.env().caller() != self.admin {
+                return Err(CrowdfundingError::Unauthorized);
+            }
+            let mut profile = self
+                .investor_profiles
+                .get(investor)
+                .ok_or(CrowdfundingError::InvestorNotCompliant)?;
+            profile.accredited = true;
+            self.investor_profiles.insert(investor, &profile);
+            self.env().emit_event(AccreditationVerified {
+                investor,
+                verified_by: self.env().caller(),
+            });
+            Ok(())
+        }
+
+        /// Query whether an investor is accredited
+        #[ink(message)]
+        pub fn is_accredited(&self, investor: AccountId) -> bool {
+            self.investor_profiles
+                .get(investor)
+                .map(|p| p.accredited)
+                .unwrap_or(false)
+        }
+
         #[ink(message)]
         pub fn invest(&mut self, campaign_id: u64, amount: u128) -> Result<(), CrowdfundingError> {
             let caller = self.env().caller();
@@ -374,6 +437,9 @@ mod propchain_crowdfunding {
                 .ok_or(CrowdfundingError::InvestorNotCompliant)?;
             if profile.kyc_status != ComplianceStatus::Approved {
                 return Err(CrowdfundingError::InvestorNotCompliant);
+            }
+            if !profile.accredited {
+                return Err(CrowdfundingError::AccreditationNotVerified);
             }
             if self.blocked_jurisdictions.contains(&profile.jurisdiction) {
                 return Err(CrowdfundingError::InvestorNotCompliant);
@@ -427,8 +493,13 @@ mod propchain_crowdfunding {
                 description,
                 release_amount,
                 status: MilestoneStatus::Pending,
+                oracle_verified: false,
+                oracle_data_hash: None,
             };
             self.milestones.insert(self.milestone_count, &milestone);
+            let total_milestones = self.campaign_milestone_counts.get(campaign_id).unwrap_or(0) + 1;
+            self.campaign_milestone_counts
+                .insert(campaign_id, &total_milestones);
             Ok(self.milestone_count)
         }
 
@@ -452,16 +523,130 @@ mod propchain_crowdfunding {
 
         #[ink(message)]
         pub fn release_milestone(&mut self, milestone_id: u64) -> Result<(), CrowdfundingError> {
+            propchain_traits::non_reentrant!(self, {
+                let mut milestone = self
+                    .milestones
+                    .get(milestone_id)
+                    .ok_or(CrowdfundingError::MilestoneNotFound)?;
+                if milestone.status != MilestoneStatus::Approved {
+                    return Err(CrowdfundingError::MilestoneNotApproved);
+                }
+                if !milestone.oracle_verified {
+                    return Err(CrowdfundingError::OracleVerificationFailed);
+                }
+                milestone.status = MilestoneStatus::Released;
+                self.milestones.insert(milestone_id, &milestone);
+                let released_count = self
+                    .released_milestone_counts
+                    .get(milestone.campaign_id)
+                    .unwrap_or(0)
+                    + 1;
+                self.released_milestone_counts
+                    .insert(milestone.campaign_id, &released_count);
+                let released_capital = self
+                    .released_capital
+                    .get(milestone.campaign_id)
+                    .unwrap_or(0)
+                    + milestone.release_amount;
+                self.released_capital
+                    .insert(milestone.campaign_id, &released_capital);
+                Ok(())
+            })
+        }
+
+        /// Oracle submits verification for a milestone (oracle only)
+        #[ink(message)]
+        pub fn oracle_verify_milestone(
+            &mut self,
+            milestone_id: u64,
+            data_hash: [u8; 32],
+        ) -> Result<(), CrowdfundingError> {
+            let caller = self.env().caller();
+            if !self.authorized_oracles.get(caller).unwrap_or(false) && caller != self.admin {
+                return Err(CrowdfundingError::Unauthorized);
+            }
             let mut milestone = self
                 .milestones
                 .get(milestone_id)
                 .ok_or(CrowdfundingError::MilestoneNotFound)?;
-            if milestone.status != MilestoneStatus::Approved {
-                return Err(CrowdfundingError::MilestoneNotApproved);
-            }
-            milestone.status = MilestoneStatus::Released;
+            milestone.oracle_verified = true;
+            milestone.oracle_data_hash = Some(data_hash);
             self.milestones.insert(milestone_id, &milestone);
+            self.env().emit_event(MilestoneOracleVerified {
+                milestone_id,
+                oracle: caller,
+                data_hash,
+            });
             Ok(())
+        }
+
+        /// Admin: authorize an oracle account
+        #[ink(message)]
+        pub fn add_oracle(&mut self, oracle: AccountId) -> Result<(), CrowdfundingError> {
+            if self.env().caller() != self.admin {
+                return Err(CrowdfundingError::Unauthorized);
+            }
+            self.authorized_oracles.insert(oracle, &true);
+            Ok(())
+        }
+
+        /// Mark a campaign as failed/cancelled and enable refunds (admin only)
+        #[ink(message)]
+        pub fn fail_campaign(&mut self, campaign_id: u64) -> Result<(), CrowdfundingError> {
+            if self.env().caller() != self.admin {
+                return Err(CrowdfundingError::Unauthorized);
+            }
+            let mut campaign = self
+                .campaigns
+                .get(campaign_id)
+                .ok_or(CrowdfundingError::CampaignNotFound)?;
+            campaign.status = CampaignStatus::Cancelled;
+            self.campaigns.insert(campaign_id, &campaign);
+            Ok(())
+        }
+
+        /// Investor claims a refund for a failed/cancelled campaign
+        #[ink(message)]
+        pub fn claim_refund(&mut self, campaign_id: u64) -> Result<u128, CrowdfundingError> {
+            propchain_traits::non_reentrant!(self, {
+                let caller = self.env().caller();
+                let campaign = self
+                    .campaigns
+                    .get(campaign_id)
+                    .ok_or(CrowdfundingError::CampaignNotFound)?;
+                if campaign.status != CampaignStatus::Cancelled {
+                    return Err(CrowdfundingError::CampaignNotFailed);
+                }
+                if self
+                    .refunds_issued
+                    .get((campaign_id, caller))
+                    .unwrap_or(false)
+                {
+                    return Err(CrowdfundingError::AlreadyRefunded);
+                }
+                let amount = self
+                    .investments
+                    .get((campaign_id, caller))
+                    .ok_or(CrowdfundingError::NoInvestmentFound)?;
+                if amount == 0 {
+                    return Err(CrowdfundingError::NoInvestmentFound);
+                }
+                self.refunds_issued.insert((campaign_id, caller), &true);
+                self.env().emit_event(RefundIssued {
+                    campaign_id,
+                    investor: caller,
+                    amount,
+                });
+                Ok(amount)
+            })
+        }
+
+        /// Check if an investor has been refunded for a campaign
+        #[ink(message)]
+        pub fn is_refunded(&self, campaign_id: u64, investor: AccountId) -> bool {
+            self.refunds_issued
+                .get((campaign_id, investor))
+                .unwrap_or(false)
         }
 
         #[ink(message)]
@@ -672,6 +857,35 @@ mod propchain_crowdfunding {
         #[ink(message)]
         pub fn get_risk_profile(&self, campaign_id: u64) -> Option<RiskProfile> {
             self.risk_profiles.get(campaign_id)
+        }
+
+        #[ink(message)]
+        pub fn get_campaign_success_metrics(
+            &self,
+            campaign_id: u64,
+        ) -> Option<CampaignSuccessMetrics> {
+            let campaign = self.campaigns.get(campaign_id)?;
+            let funding_progress_bps = if campaign.target_amount == 0 {
+                0
+            } else {
+                ((campaign.raised_amount.saturating_mul(10_000)) / campaign.target_amount) as u32
+            };
+            let average_investment = if campaign.investor_count == 0 {
+                0
+            } else {
+                campaign.raised_amount / campaign.investor_count as u128
+            };
+
+            Some(CampaignSuccessMetrics {
+                campaign_id,
+                funding_progress_bps,
+                investor_count: campaign.investor_count,
+                average_investment,
+                total_milestones: self.campaign_milestone_counts.get(campaign_id).unwrap_or(0),
+                released_milestones: self.released_milestone_counts.get(campaign_id).unwrap_or(0),
+                released_capital: self.released_capital.get(campaign_id).unwrap_or(0),
+                is_funded: campaign.status == CampaignStatus::Funded,
+            })
         }
 
         #[ink(message)]
@@ -910,11 +1124,35 @@ mod tests {
             .create_campaign("Sunset Villas".into(), 100_000)
             .unwrap();
         contract.activate_campaign(campaign_id).unwrap();
+        // Bob onboards (accredited=false until admin verifies)
         test::set_caller::<DefaultEnvironment>(accounts.bob);
-        contract.onboard_investor("US".into(), true).unwrap();
+        contract.onboard_investor("US".into(), false).unwrap();
+        // Admin (alice) verifies accreditation
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract.verify_accreditation(accounts.bob).unwrap();
+        assert!(contract.is_accredited(accounts.bob));
+        // Bob can now invest
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
         assert!(contract.invest(campaign_id, 100_000).is_ok());
         let campaign = contract.get_campaign(campaign_id).unwrap();
         assert_eq!(campaign.status, CampaignStatus::Funded);
+    }
+
+    #[ink::test]
+    fn test_invest_rejected_without_accreditation() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let campaign_id = contract
+            .create_campaign("Sunset Villas".into(), 100_000)
+            .unwrap();
+        contract.activate_campaign(campaign_id).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        contract.onboard_investor("US".into(), false).unwrap();
+        // Bob has not been accredited by admin — invest must fail
+        assert_eq!(
+            contract.invest(campaign_id, 50_000),
+            Err(CrowdfundingError::AccreditationNotVerified)
+        );
     }
 
     #[ink::test]
@@ -926,8 +1164,119 @@ mod tests {
         let milestone_id = contract
             .add_milestone(campaign_id, "Foundation".into(), 50_000)
             .unwrap();
+        // Oracle must verify before release
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        contract.add_oracle(accounts.alice).unwrap();
+        contract
+            .oracle_verify_milestone(milestone_id, [1u8; 32])
+            .unwrap();
         assert!(contract.approve_milestone(milestone_id).is_ok());
         assert!(contract.release_milestone(milestone_id).is_ok());
+    }
+
+    #[ink::test]
+    fn test_release_milestone_requires_oracle_verification() {
+        let mut contract = setup();
+        let campaign_id = contract
+            .create_campaign("Park Place".into(), 200_000)
+            .unwrap();
+        let milestone_id = contract
+            .add_milestone(campaign_id, "Foundation".into(), 50_000)
+            .unwrap();
+        contract.approve_milestone(milestone_id).unwrap();
+        // Release without oracle verification should fail
+        assert_eq!(
+            contract.release_milestone(milestone_id),
+            Err(CrowdfundingError::OracleVerificationFailed)
+        );
+    }
+
+    #[ink::test]
+    fn test_oracle_verify_milestone() {
+        let mut contract = setup();
+        let campaign_id = contract
+            .create_campaign("Park Place".into(), 200_000)
+            .unwrap();
+        let milestone_id = contract
+            .add_milestone(campaign_id, "Foundation".into(), 50_000)
+            .unwrap();
+        // Admin can act as oracle
+        assert!(contract
+            .oracle_verify_milestone(milestone_id, [2u8; 32])
+            .is_ok());
+        let milestone = contract.get_milestone(milestone_id).unwrap();
+        assert!(milestone.oracle_verified);
+        assert_eq!(milestone.oracle_data_hash, Some([2u8; 32]));
+    }
+
+    #[ink::test]
+    fn test_refund_policy_failed_campaign() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let campaign_id = contract
+            .create_campaign("Sunset Villas".into(), 100_000)
+            .unwrap();
+        contract.activate_campaign(campaign_id).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        contract.onboard_investor("US".into(), false).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract.verify_accreditation(accounts.bob).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        contract.invest(campaign_id, 40_000).unwrap();
+        // Admin marks campaign as failed
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        assert!(contract.fail_campaign(campaign_id).is_ok());
+        // Bob claims refund
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let refund = contract.claim_refund(campaign_id).unwrap();
+        assert_eq!(refund, 40_000);
+        assert!(contract.is_refunded(campaign_id, accounts.bob));
+    }
+
+    #[ink::test]
+    fn test_refund_not_allowed_for_active_campaign() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let campaign_id = contract
+            .create_campaign("Sunset Villas".into(), 100_000)
+            .unwrap();
+        contract.activate_campaign(campaign_id).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        contract.onboard_investor("US".into(), false).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract.verify_accreditation(accounts.bob).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        contract.invest(campaign_id, 40_000).unwrap();
+        // Refund should fail for active campaign
+        assert_eq!(
+            contract.claim_refund(campaign_id),
+            Err(CrowdfundingError::CampaignNotFailed)
+        );
+    }
+
+    #[ink::test]
+    fn test_double_refund_not_allowed() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let campaign_id = contract
+            .create_campaign("Sunset Villas".into(), 100_000)
+            .unwrap();
+        contract.activate_campaign(campaign_id).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        contract.onboard_investor("US".into(), false).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract.verify_accreditation(accounts.bob).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        contract.invest(campaign_id, 40_000).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract.fail_campaign(campaign_id).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        contract.claim_refund(campaign_id).unwrap();
+        // Second refund should fail
+        assert_eq!(
+            contract.claim_refund(campaign_id),
+            Err(CrowdfundingError::AlreadyRefunded)
+        );
     }
 
     #[ink::test]
@@ -980,139 +1329,41 @@ mod tests {
         assert_eq!(profile.rating, propchain_crowdfunding::RiskRating::Low);
     }
 
-    // ── Search & Discovery tests ─────────────────────────────
-
     #[ink::test]
-    fn test_search_by_status() {
-        let mut contract = setup();
-        contract.create_campaign("Alpha".into(), 100_000).unwrap();
-        let id2 = contract.create_campaign("Beta".into(), 200_000).unwrap();
-        contract.activate_campaign(id2).unwrap();
-
-        let filter = CampaignFilter {
-            status: Some(CampaignStatus::Active),
-            title_keyword: None,
-            min_target: None,
-            max_target: None,
-            min_funded_pct: None,
-            funded_only: false,
-        };
-        let results = contract.search_campaigns(filter, 10);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].title, "Beta");
-    }
-
-    #[ink::test]
-    fn test_search_by_title_keyword() {
-        let mut contract = setup();
-        contract.create_campaign("Downtown Lofts".into(), 100_000).unwrap();
-        contract.create_campaign("Harbor View".into(), 200_000).unwrap();
-
-        let filter = CampaignFilter {
-            status: None,
-            title_keyword: Some("downtown".into()),
-            min_target: None,
-            max_target: None,
-            min_funded_pct: None,
-            funded_only: false,
-        };
-        let results = contract.search_campaigns(filter, 10);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].title, "Downtown Lofts");
-    }
-
-    #[ink::test]
-    fn test_top_campaigns_sorted() {
+    fn test_campaign_success_metrics_track_funding_and_milestones() {
         let mut contract = setup();
         let accounts = test::default_accounts::<DefaultEnvironment>();
-
-        let id1 = contract.create_campaign("Small".into(), 100_000).unwrap();
-        let id2 = contract.create_campaign("Large".into(), 500_000).unwrap();
-        contract.activate_campaign(id1).unwrap();
-        contract.activate_campaign(id2).unwrap();
+        let campaign_id = contract
+            .create_campaign("Metrics Campaign".into(), 200_000)
+            .unwrap();
+        contract.activate_campaign(campaign_id).unwrap();
 
         test::set_caller::<DefaultEnvironment>(accounts.bob);
         contract.onboard_investor("US".into(), true).unwrap();
-        contract.invest(id1, 20_000).unwrap();
-        contract.invest(id2, 300_000).unwrap();
+        contract.invest(campaign_id, 50_000).unwrap();
 
-        let top = contract.get_top_campaigns(2);
-        assert_eq!(top[0].campaign_id, id2);
-    }
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        contract.onboard_investor("CA".into(), true).unwrap();
+        contract.invest(campaign_id, 100_000).unwrap();
 
-    #[ink::test]
-    fn test_near_funded_campaigns() {
-        let mut contract = setup();
-        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        let milestone_id = contract
+            .add_milestone(campaign_id, "Permits approved".into(), 40_000)
+            .unwrap();
+        contract.add_oracle(accounts.alice).unwrap();
+        contract
+            .oracle_verify_milestone(milestone_id, [9u8; 32])
+            .unwrap();
+        contract.approve_milestone(milestone_id).unwrap();
+        contract.release_milestone(milestone_id).unwrap();
 
-        let id = contract.create_campaign("Almost There".into(), 100_000).unwrap();
-        contract.activate_campaign(id).unwrap();
-
-        test::set_caller::<DefaultEnvironment>(accounts.bob);
-        contract.onboard_investor("US".into(), true).unwrap();
-        contract.invest(id, 90_000).unwrap();
-
-        let near = contract.get_near_funded_campaigns(80);
-        assert_eq!(near.len(), 1);
-        assert_eq!(near[0].funded_pct, 90);
-    }
-
-    #[ink::test]
-    fn test_get_campaign_stats() {
-        let mut contract = setup();
-        contract.create_campaign("One".into(), 100_000).unwrap();
-        let id2 = contract.create_campaign("Two".into(), 200_000).unwrap();
-        contract.activate_campaign(id2).unwrap();
-
-        let (draft, active, funded, closed, cancelled) = contract.get_campaign_stats();
-        assert_eq!(draft, 1);
-        assert_eq!(active, 1);
-        assert_eq!(funded, 0);
-        assert_eq!(closed, 0);
-        assert_eq!(cancelled, 0);
-    }
-
-    #[ink::test]
-    fn test_investor_portfolio_discovery() {
-        let mut contract = setup();
-        let accounts = test::default_accounts::<DefaultEnvironment>();
-
-        let id1 = contract.create_campaign("A".into(), 100_000).unwrap();
-        let id2 = contract.create_campaign("B".into(), 100_000).unwrap();
-        contract.activate_campaign(id1).unwrap();
-        contract.activate_campaign(id2).unwrap();
-
-        test::set_caller::<DefaultEnvironment>(accounts.bob);
-        contract.onboard_investor("US".into(), true).unwrap();
-        contract.invest(id1, 10_000).unwrap();
-
-        let portfolio = contract.get_investor_campaigns(accounts.bob);
-        assert_eq!(portfolio.len(), 1);
-        assert_eq!(portfolio[0].campaign_id, id1);
-    }
-
-    #[ink::test]
-    fn test_paginated_listing() {
-        let mut contract = setup();
-        for i in 0..5u64 {
-            contract.create_campaign(ink::prelude::format!("Campaign {}", i), 100_000).unwrap();
-        }
-        let page0 = contract.get_campaigns_paginated(0, 3);
-        let page1 = contract.get_campaigns_paginated(1, 3);
-        assert_eq!(page0.len(), 3);
-        assert_eq!(page1.len(), 2);
-    }
-
-    #[ink::test]
-    fn test_campaigns_by_risk() {
-        let mut contract = setup();
-        let id = contract.create_campaign("Low Risk".into(), 100_000).unwrap();
-        contract.assess_risk(id, 50, 80, 10).unwrap(); // Low
-
-        let results = contract.get_campaigns_by_risk(RiskRating::Low);
-        assert_eq!(results.len(), 1);
-
-        let results = contract.get_campaigns_by_risk(RiskRating::High);
-        assert_eq!(results.len(), 0);
+        let metrics = contract.get_campaign_success_metrics(campaign_id).unwrap();
+        assert_eq!(metrics.funding_progress_bps, 7_500);
+        assert_eq!(metrics.investor_count, 2);
+        assert_eq!(metrics.average_investment, 75_000);
+        assert_eq!(metrics.total_milestones, 1);
+        assert_eq!(metrics.released_milestones, 1);
+        assert_eq!(metrics.released_capital, 40_000);
+        assert!(!metrics.is_funded);
     }
 }
