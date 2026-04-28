@@ -29,6 +29,7 @@ mod propchain_lending {
         ProposalNotFound,
         RestructuringNotFound,
         InsufficientVotes,
+        PaymentScheduleNotFound,
         ReentrantCall,
     }
 
@@ -138,6 +139,42 @@ mod propchain_lending {
     }
 
     #[derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub enum PaymentScheduleStatus {
+        Active,
+        Completed,
+        Defaulted,
+    }
+
+    #[derive(
+        Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct PaymentSchedule {
+        pub schedule_id: u64,
+        pub loan_id: u64,
+        pub borrower: AccountId,
+        pub principal_due: u128,
+        pub interest_due: u128,
+        pub installment_amount: u128,
+        pub total_installments: u32,
+        pub installments_paid: u32,
+        pub first_due_block: u64,
+        pub interval_blocks: u64,
+        pub next_due_block: u64,
+        pub total_paid: u128,
+        pub status: PaymentScheduleStatus,
+    }
+
+    #[derive(
         Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
@@ -202,6 +239,9 @@ mod propchain_lending {
         loan_applications: Mapping<u64, LoanApplication>,
         loan_restructurings: Mapping<u64, LoanRestructuring>,
         loan_count: u64,
+        payment_schedules: Mapping<u64, PaymentSchedule>,
+        loan_payment_schedule: Mapping<u64, u64>,
+        schedule_count: u64,
         yield_positions: Mapping<AccountId, YieldPosition>,
         total_staked: u128,
         reward_per_block: u128,
@@ -291,6 +331,9 @@ mod propchain_lending {
                 loan_applications: Mapping::default(),
                 loan_restructurings: Mapping::default(),
                 loan_count: 0,
+                payment_schedules: Mapping::default(),
+                loan_payment_schedule: Mapping::default(),
+                schedule_count: 0,
                 yield_positions: Mapping::default(),
                 total_staked: 0,
                 reward_per_block: 100,
@@ -873,6 +916,9 @@ mod propchain_lending {
     }
 }
 
+pub use crate::propchain_lending::{
+    LendingError, PaymentSchedule, PaymentScheduleStatus, PropertyLending,
+};
 pub use crate::propchain_lending::{LendingError, LoanStatus, PropertyLending};
 
 #[cfg(test)]
