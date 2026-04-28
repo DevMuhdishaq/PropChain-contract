@@ -401,6 +401,44 @@ pub mod propchain_identity {
         timestamp: u64,
     }
 
+    /// Emitted when a KYC verification has expired
+    #[ink(event)]
+    pub struct KycExpired {
+        #[ink(topic)]
+        account: AccountId,
+        expired_at: u64,
+        timestamp: u64,
+    }
+
+    /// Emitted when KYC renewal is required (approaching expiry)
+    #[ink(event)]
+    pub struct KycRenewalRequired {
+        #[ink(topic)]
+        account: AccountId,
+        expires_at: u64,
+        timestamp: u64,
+    }
+
+    /// Emitted when a DID document is updated
+    #[ink(event)]
+    pub struct DIDUpdated {
+        #[ink(topic)]
+        account: AccountId,
+        #[ink(topic)]
+        did: String,
+        version: u32,
+        timestamp: u64,
+    }
+
+    /// Emitted when a ZK KYC proof is verified
+    #[ink(event)]
+    pub struct ZkKycVerified {
+        #[ink(topic)]
+        account: AccountId,
+        proof_type: String,
+        timestamp: u64,
+    }
+
     impl Default for IdentityRegistry {
         fn default() -> Self {
             Self {
@@ -1319,6 +1357,224 @@ pub mod propchain_identity {
         pub fn get_supported_chains(&self) -> Vec<ChainId> {
             self.supported_chains.clone()
         }
+
+        // ── Issue #279: DID support ──────────────────────────────────────────
+
+        /// Update the DID document for the caller's identity (public key, method, endpoint)
+        #[ink(message)]
+        pub fn update_did(
+            &mut self,
+            new_public_key: Vec<u8>,
+            new_verification_method: String,
+            new_service_endpoint: Option<String>,
+        ) -> Result<(), IdentityError> {
+            let caller = self.env().caller();
+            let timestamp = self.env().block_timestamp();
+
+            let mut identity = self
+                .identities
+                .get(&caller)
+                .ok_or(IdentityError::IdentityNotFound)?;
+
+            identity.did_document.public_key = new_public_key;
+            identity.did_document.verification_method = new_verification_method;
+            identity.did_document.service_endpoint = new_service_endpoint;
+            identity.did_document.updated_at = timestamp;
+            identity.did_document.version = identity.did_document.version.saturating_add(1);
+            identity.last_activity = timestamp;
+
+            let did = identity.did_document.did.clone();
+            let version = identity.did_document.version;
+            self.identities.insert(&caller, &identity);
+
+            self.env().emit_event(DIDUpdated {
+                account: caller,
+                did,
+                version,
+                timestamp,
+            });
+
+            self.add_audit_entry(caller, caller, "did_updated".into(), "DID document updated".into());
+            Ok(())
+        }
+
+        /// Resolve a DID string to its account and DID document
+        #[ink(message)]
+        pub fn resolve_did(&self, did: String) -> Option<(AccountId, DIDDocument)> {
+            let account = self.did_to_account.get(&did)?;
+            let identity = self.identities.get(&account)?;
+            Some((account, identity.did_document))
+        }
+
+        // ── Issue #280: Zero-knowledge KYC proofs ───────────────────────────
+
+        /// Verify a zero-knowledge KYC proof without exposing personal data.
+        ///
+        /// Supported `proof_type` values:
+        /// - `"kyc_age"` – proves the subject is above a minimum age
+        /// - `"kyc_residency"` – proves residency in an allowed jurisdiction
+        /// - `"kyc_accredited"` – proves accredited-investor status
+        /// - `"kyc_aml"` – proves AML/sanctions-list clearance
+        ///
+        /// `proof` is the serialised ZK proof bytes; `public_inputs` are the
+        /// public statement bytes that the verifier checks against.
+        #[ink(message)]
+        pub fn verify_zk_kyc_proof(
+            &mut self,
+            proof: Vec<u8>,
+            public_inputs: Vec<u8>,
+            proof_type: String,
+        ) -> Result<bool, IdentityError> {
+            let caller = self.env().caller();
+            let timestamp = self.env().block_timestamp();
+
+            let mut identity = self
+                .identities
+                .get(&caller)
+                .ok_or(IdentityError::IdentityNotFound)?;
+
+            if !identity.privacy_settings.zero_knowledge_proof {
+                return Err(IdentityError::PrivacyVerificationFailed);
+            }
+
+            let is_valid = self.verify_zk_kyc(&proof, &public_inputs, &proof_type);
+
+            if is_valid {
+                let nonce = self.privacy_nonces.get(&caller).unwrap_or(0);
+                self.privacy_nonces.insert(&caller, &(nonce + 1));
+                identity.last_activity = timestamp;
+                self.identities.insert(&caller, &identity);
+
+                self.env().emit_event(ZkKycVerified {
+                    account: caller,
+                    proof_type: proof_type.clone(),
+                    timestamp,
+                });
+
+                self.add_audit_entry(
+                    caller,
+                    caller,
+                    "zk_kyc_verified".into(),
+                    proof_type,
+                );
+            }
+
+            Ok(is_valid)
+        }
+
+        /// Internal ZK KYC proof verifier.
+        ///
+        /// Each KYC proof type has its own minimum proof/input size requirement
+        /// that acts as a stand-in for a real ZK verifier circuit.  In a
+        /// production deployment these checks would be replaced by calls to an
+        /// on-chain verifier contract (e.g. Groth16 / PLONK).
+        fn verify_zk_kyc(&self, proof: &[u8], public_inputs: &[u8], proof_type: &str) -> bool {
+            match proof_type {
+                // Age proof: 64-byte proof + 8-byte public input (encoded minimum age)
+                "kyc_age" => proof.len() >= 64 && public_inputs.len() >= 8,
+                // Residency proof: 64-byte proof + 4-byte jurisdiction code
+                "kyc_residency" => proof.len() >= 64 && public_inputs.len() >= 4,
+                // Accredited-investor proof: 128-byte proof + 16-byte commitment
+                "kyc_accredited" => proof.len() >= 128 && public_inputs.len() >= 16,
+                // AML clearance proof: 64-byte proof + 32-byte nullifier
+                "kyc_aml" => proof.len() >= 64 && public_inputs.len() >= 32,
+                _ => false,
+            }
+        }
+
+        // ── Issue #281: KYC expiration handling ─────────────────────────────
+
+        /// Returns `true` when the caller's KYC verification has expired.
+        #[ink(message)]
+        pub fn is_kyc_expired(&self, account: AccountId) -> bool {
+            let timestamp = self.env().block_timestamp();
+            if let Some(identity) = self.identities.get(&account) {
+                if let Some(expires) = identity.verification_expires {
+                    return timestamp >= expires;
+                }
+            }
+            false
+        }
+
+        /// Check KYC expiration status and emit the appropriate event.
+        ///
+        /// - If already expired → emits `KycExpired` and returns `Err(VerificationFailed)`.
+        /// - If expiring within `warning_window_secs` → emits `KycRenewalRequired` and returns `Ok(false)`.
+        /// - Otherwise → returns `Ok(true)`.
+        #[ink(message)]
+        pub fn check_kyc_expiration(
+            &mut self,
+            account: AccountId,
+            warning_window_secs: u64,
+        ) -> Result<bool, IdentityError> {
+            let timestamp = self.env().block_timestamp();
+
+            let identity = self
+                .identities
+                .get(&account)
+                .ok_or(IdentityError::IdentityNotFound)?;
+
+            let expires_at = match identity.verification_expires {
+                Some(e) => e,
+                None => return Ok(true), // no expiry set → always valid
+            };
+
+            if timestamp >= expires_at {
+                self.env().emit_event(KycExpired {
+                    account,
+                    expired_at: expires_at,
+                    timestamp,
+                });
+                return Err(IdentityError::VerificationFailed);
+            }
+
+            if expires_at.saturating_sub(timestamp) <= warning_window_secs {
+                self.env().emit_event(KycRenewalRequired {
+                    account,
+                    expires_at,
+                    timestamp,
+                });
+                return Ok(false);
+            }
+
+            Ok(true)
+        }
+
+        /// Renew KYC for an account (verifier only).  Extends the expiry by
+        /// `extend_days` days from the current block timestamp.
+        #[ink(message)]
+        pub fn renew_kyc(
+            &mut self,
+            target_account: AccountId,
+            extend_days: u64,
+        ) -> Result<(), IdentityError> {
+            let caller = self.env().caller();
+            let timestamp = self.env().block_timestamp();
+
+            if !self.is_authorized_verifier(caller) {
+                return Err(IdentityError::Unauthorized);
+            }
+
+            let mut identity = self
+                .identities
+                .get(&target_account)
+                .ok_or(IdentityError::IdentityNotFound)?;
+
+            let new_expiry = timestamp + extend_days * 86_400;
+            identity.verification_expires = Some(new_expiry);
+            identity.is_verified = true;
+            identity.last_activity = timestamp;
+            self.identities.insert(&target_account, &identity);
+
+            self.add_audit_entry(
+                target_account,
+                caller,
+                "kyc_renewed".into(),
+                "KYC expiry extended".into(),
+            );
+
+            Ok(())
+        }
     }
 
     #[cfg(test)]
@@ -1429,6 +1685,166 @@ pub mod propchain_identity {
                 reg.revoke_identity(accounts.alice, "Unauthorized".into()),
                 Err(IdentityError::Unauthorized)
             );
+        }
+
+        // ── Issue #279: DID support tests ────────────────────────────────────
+
+        #[ink::test]
+        fn test_update_did() {
+            let mut reg = default_registry();
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            reg.create_identity(
+                "did:prop:alice1".into(),
+                vec![1u8; 32],
+                "Ed25519".into(),
+                None,
+                make_privacy(),
+            )
+            .unwrap();
+            let identity_before = reg.get_identity(accounts.alice).unwrap();
+            assert_eq!(identity_before.did_document.version, 1);
+
+            reg.update_did(vec![2u8; 32], "Sr25519".into(), Some("https://example.com".into()))
+                .unwrap();
+
+            let identity_after = reg.get_identity(accounts.alice).unwrap();
+            assert_eq!(identity_after.did_document.version, 2);
+            assert_eq!(identity_after.did_document.public_key, vec![2u8; 32]);
+            assert_eq!(identity_after.did_document.verification_method, "Sr25519");
+            assert_eq!(
+                identity_after.did_document.service_endpoint,
+                Some("https://example.com".into())
+            );
+        }
+
+        #[ink::test]
+        fn test_resolve_did() {
+            let mut reg = default_registry();
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            reg.create_identity(
+                "did:prop:alice2".into(),
+                vec![1u8; 32],
+                "Ed25519".into(),
+                None,
+                make_privacy(),
+            )
+            .unwrap();
+            let result = reg.resolve_did("did:prop:alice2".into());
+            assert!(result.is_some());
+            let (account, doc) = result.unwrap();
+            assert_eq!(account, accounts.alice);
+            assert_eq!(doc.did, "did:prop:alice2");
+        }
+
+        // ── Issue #280: ZK KYC proof tests ───────────────────────────────────
+
+        #[ink::test]
+        fn test_verify_zk_kyc_proof_age() {
+            let mut reg = default_registry();
+            let privacy = PrivacySettings {
+                public_reputation: true,
+                public_verification: true,
+                data_sharing_consent: true,
+                zero_knowledge_proof: true,
+                selective_disclosure: Vec::new(),
+            };
+            reg.create_identity(
+                "did:prop:zk1".into(),
+                vec![1u8; 32],
+                "Ed25519".into(),
+                None,
+                privacy,
+            )
+            .unwrap();
+
+            // Valid age proof
+            let result = reg.verify_zk_kyc_proof(vec![0u8; 64], vec![0u8; 8], "kyc_age".into());
+            assert_eq!(result, Ok(true));
+
+            // Invalid: proof too short
+            let result = reg.verify_zk_kyc_proof(vec![0u8; 10], vec![0u8; 8], "kyc_age".into());
+            assert_eq!(result, Ok(false));
+        }
+
+        #[ink::test]
+        fn test_verify_zk_kyc_proof_disabled() {
+            let mut reg = default_registry();
+            reg.create_identity(
+                "did:prop:zk2".into(),
+                vec![1u8; 32],
+                "Ed25519".into(),
+                None,
+                make_privacy(), // zero_knowledge_proof = false
+            )
+            .unwrap();
+            let result = reg.verify_zk_kyc_proof(vec![0u8; 64], vec![0u8; 8], "kyc_age".into());
+            assert_eq!(result, Err(IdentityError::PrivacyVerificationFailed));
+        }
+
+        // ── Issue #281: KYC expiration tests ─────────────────────────────────
+
+        #[ink::test]
+        fn test_is_kyc_expired_no_expiry() {
+            let mut reg = default_registry();
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            reg.create_identity(
+                "did:prop:exp1".into(),
+                vec![1u8; 32],
+                "Ed25519".into(),
+                None,
+                make_privacy(),
+            )
+            .unwrap();
+            // No expiry set → not expired
+            assert!(!reg.is_kyc_expired(accounts.alice));
+        }
+
+        #[ink::test]
+        fn test_kyc_expiration_and_renewal() {
+            let mut reg = default_registry();
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            reg.create_identity(
+                "did:prop:exp2".into(),
+                vec![1u8; 32],
+                "Ed25519".into(),
+                None,
+                make_privacy(),
+            )
+            .unwrap();
+            reg.add_authorized_verifier(accounts.alice).unwrap();
+
+            // Verify with 30-day expiry
+            reg.verify_identity(accounts.alice, VerificationLevel::Standard, Some(30))
+                .unwrap();
+
+            // Not expired yet (block_timestamp defaults to 0 in tests)
+            assert!(!reg.is_kyc_expired(accounts.alice));
+
+            // Renew for another 60 days
+            reg.renew_kyc(accounts.alice, 60).unwrap();
+            let identity = reg.get_identity(accounts.alice).unwrap();
+            assert!(identity.verification_expires.is_some());
+        }
+
+        #[ink::test]
+        fn test_check_kyc_expiration_valid() {
+            let mut reg = default_registry();
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            reg.create_identity(
+                "did:prop:exp3".into(),
+                vec![1u8; 32],
+                "Ed25519".into(),
+                None,
+                make_privacy(),
+            )
+            .unwrap();
+            reg.add_authorized_verifier(accounts.alice).unwrap();
+            // 30-day expiry; block_timestamp = 0 so far in future
+            reg.verify_identity(accounts.alice, VerificationLevel::Standard, Some(30))
+                .unwrap();
+            // 1-day warning window; expiry is 30 days away → Ok(true)
+            let result = reg.check_kyc_expiration(accounts.alice, 86_400);
+            assert_eq!(result, Ok(true));
         }
     }
 }
