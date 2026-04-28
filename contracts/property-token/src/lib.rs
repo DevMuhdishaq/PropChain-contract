@@ -10,8 +10,8 @@
 
 use ink::prelude::string::String;
 use ink::storage::Mapping;
-use propchain_contracts::{non_reentrant, ReentrancyError, ReentrancyGuard};
 use propchain_traits::*;
+use propchain_traits::{non_reentrant, ReentrancyError, ReentrancyGuard};
 #[cfg(not(feature = "std"))]
 use scale_info::prelude::vec::Vec;
 
@@ -112,6 +112,14 @@ pub mod property_token {
         vesting_schedules: Mapping<(TokenId, AccountId), VestingSchedule>,
         /// Custom URI overrides for tokens
         token_uris: Mapping<TokenId, String>,
+
+        /// Staking state
+        share_stakes: Mapping<(AccountId, TokenId), ShareStakeInfo>,
+        share_total_staked: Mapping<TokenId, u128>,
+        share_reward_pool: Mapping<TokenId, u128>,
+        share_reward_rate_bps: Mapping<TokenId, u128>,
+        share_acc_reward_per_share: Mapping<TokenId, u128>,
+        share_last_reward_block: Mapping<TokenId, u64>,
 
         /// Reentrancy protection guard
         reentrancy_guard: ReentrancyGuard,
