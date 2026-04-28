@@ -10,8 +10,8 @@
 
 use ink::prelude::string::String;
 use ink::storage::Mapping;
-use propchain_contracts::{non_reentrant, ReentrancyError, ReentrancyGuard};
 use propchain_traits::*;
+use propchain_traits::{non_reentrant, ReentrancyError, ReentrancyGuard};
 #[cfg(not(feature = "std"))]
 use scale_info::prelude::vec::Vec;
 
@@ -91,10 +91,35 @@ pub mod property_token {
         property_management_contract: Option<AccountId>,
         /// On-chain management agent per property token (tokenized property)
         management_agent: Mapping<TokenId, AccountId>,
+
+
+        // KYC-based transfer restriction fields
+        /// Transfer restriction configuration per token
+        transfer_restrictions: Mapping<TokenId, TransferRestrictionConfig>,
+        /// User transfer quota tracking (token_id, account) -> quota
+        user_transfer_quotas: Mapping<(TokenId, AccountId), UserTransferQuota>,
+        /// Blacklisted accounts that cannot transfer tokens
+        blacklist: Mapping<AccountId, bool>,
+        /// Whitelisted accounts (if whitelist-only restriction is enabled)
+        whitelist: Mapping<(TokenId, AccountId), bool>,
+        /// Cached KYC verification levels to reduce cross-contract calls
+        kyc_verification_cache: Mapping<AccountId, (KYCVerificationLevel, u64)>, // (level, block_cached)
+        /// KYC transfer audit log
+        kyc_transfer_log: Mapping<u64, KYCTransferEvent>,
+        kyc_transfer_log_counter: u64,
+
         /// Vesting schedules for tokens (TokenId, AccountId)
         vesting_schedules: Mapping<(TokenId, AccountId), VestingSchedule>,
         /// Custom URI overrides for tokens
         token_uris: Mapping<TokenId, String>,
+
+        /// Staking state
+        share_stakes: Mapping<(AccountId, TokenId), ShareStakeInfo>,
+        share_total_staked: Mapping<TokenId, u128>,
+        share_reward_pool: Mapping<TokenId, u128>,
+        share_reward_rate_bps: Mapping<TokenId, u128>,
+        share_acc_reward_per_share: Mapping<TokenId, u128>,
+        share_last_reward_block: Mapping<TokenId, u64>,
 
         /// Reentrancy protection guard
         reentrancy_guard: ReentrancyGuard,
@@ -415,6 +440,61 @@ pub mod property_token {
         pub token_id: TokenId,
     }
 
+
+    // --- KYC Transfer Restriction Events ---
+    #[ink(event)]
+    pub struct TransferRestrictionConfigured {
+        #[ink(topic)]
+        pub token_id: TokenId,
+        pub restriction_level: String,
+        pub min_verification_level: u8,
+        pub max_transfer_amount: u128,
+    }
+
+    #[ink(event)]
+    pub struct TransferRestrictionRemoved {
+        #[ink(topic)]
+        pub token_id: TokenId,
+    }
+
+    #[ink(event)]
+    pub struct KYCTransferVerified {
+        #[ink(topic)]
+        pub from: AccountId,
+        #[ink(topic)]
+        pub to: AccountId,
+        #[ink(topic)]
+        pub token_id: TokenId,
+        pub amount: u128,
+        pub from_verification_level: u8,
+        pub to_verification_level: u8,
+    }
+
+    #[ink(event)]
+    pub struct KYCTransferRejected {
+        #[ink(topic)]
+        pub from: AccountId,
+        #[ink(topic)]
+        pub to: AccountId,
+        #[ink(topic)]
+        pub token_id: TokenId,
+        pub reason: String,
+    }
+
+    #[ink(event)]
+    pub struct AccountBlacklisted {
+        #[ink(topic)]
+        pub account: AccountId,
+        pub status: bool,
+    }
+
+    #[ink(event)]
+    pub struct AccountWhitelisted {
+        #[ink(topic)]
+        pub token_id: TokenId,
+        #[ink(topic)]
+        pub account: AccountId,
+        pub status: bool,
     // --- Staking Events ---
     #[ink(event)]
     pub struct SharesStaked {
@@ -475,6 +555,7 @@ pub mod property_token {
         #[ink(topic)]
         pub account: AccountId,
         pub amount: u128,
+
     }
 
     // --- Supply Management Events ---
@@ -572,8 +653,19 @@ pub mod property_token {
                 max_batch_size: 50,
                 property_management_contract: None,
                 management_agent: Mapping::default(),
+
+                // Initialize KYC transfer restriction fields
+                transfer_restrictions: Mapping::default(),
+                user_transfer_quotas: Mapping::default(),
+                blacklist: Mapping::default(),
+                whitelist: Mapping::default(),
+                kyc_verification_cache: Mapping::default(),
+                kyc_transfer_log: Mapping::default(),
+                kyc_transfer_log_counter: 0,
+
                 vesting_schedules: Mapping::default(),
                 token_uris: Mapping::default(),
+
                 reentrancy_guard: ReentrancyGuard::new(),
                 snapshot_counter: Mapping::default(),
                 snapshots: Mapping::default(),
@@ -587,6 +679,8 @@ pub mod property_token {
                 share_reward_pool: Mapping::default(),
             }
         }
+
+
 
         /// ERC-721: Returns the balance of tokens owned by an account
         #[ink(message)]
@@ -645,6 +739,8 @@ pub mod property_token {
             {
                 return Err(Error::Unauthorized);
             }
+
+
 
             // Perform the transfer
             self.remove_token_from_owner(from, token_id)?;
@@ -783,6 +879,16 @@ pub mod property_token {
                 return Err(Error::LengthMismatch);
             }
 
+
+            // Verify KYC transfer restrictions for all tokens
+            for i in 0..ids.len() {
+                let token_id = ids[i];
+                let amount = amounts[i];
+                self.verify_kyc_transfer(&from, &to, token_id, amount)?;
+            }
+
+            // Transfer each token
+
             if ids.is_empty() {
                 return Err(Error::InvalidAmount);
             }
@@ -799,15 +905,20 @@ pub mod property_token {
             }
 
             // Execute all transfers
+
             for i in 0..ids.len() {
                 let token_id = ids[i];
                 let amount = amounts[i];
                 let from_balance = self.balances.get((&from, &token_id)).unwrap_or(0);
+
                 self.balances
                     .insert((&from, &token_id), &(from_balance - amount));
                 let to_balance = self.balances.get((&to, &token_id)).unwrap_or(0);
                 self.balances
                     .insert((&to, &token_id), &(to_balance + amount));
+
+                // Update transfer quota
+                self.update_transfer_quota(&from, &to, token_id, amount)?;
             }
 
             // Single batch event instead of N individual events
@@ -845,6 +956,309 @@ pub mod property_token {
                 return Err(Error::Unauthorized);
             }
             self.compliance_registry = Some(registry);
+            Ok(())
+        }
+
+        // --- KYC-Based Transfer Restriction Management ---
+
+        /// Configures KYC-based transfer restrictions for a specific token
+        /// Only admin can configure transfer restrictions
+        #[ink(message)]
+        pub fn configure_transfer_restrictions(
+            &mut self,
+            token_id: TokenId,
+            restriction_level: u8, // 0=None, 1=KYCRequired, 2=VerificationLevel, 3=WhitelistOnly, 4=BlacklistBased
+            min_verification_level: u8, // 0-4
+            max_transfer_amount: u128,
+            quota_period: u32,
+            hold_period: u32,
+            check_risk_level: bool,
+            max_allowed_risk_level: u8,
+        ) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+
+            // Verify token exists
+            if self.token_owner.get(token_id).is_none() {
+                return Err(Error::TokenNotFound);
+            }
+
+            let level_str = match restriction_level {
+                0 => "None",
+                1 => "KYCRequired",
+                2 => "VerificationLevelRequired",
+                3 => "WhitelistOnly",
+                4 => "BlacklistBased",
+                _ => return Err(Error::InvalidRequest),
+            };
+
+            let restriction_level_enum = match restriction_level {
+                0 => TransferRestrictionLevel::None,
+                1 => TransferRestrictionLevel::KYCRequired,
+                2 => TransferRestrictionLevel::VerificationLevelRequired,
+                3 => TransferRestrictionLevel::WhitelistOnly,
+                4 => TransferRestrictionLevel::BlacklistBased,
+                _ => return Err(Error::InvalidRequest),
+            };
+
+            let min_level = match min_verification_level {
+                0 => KYCVerificationLevel::None,
+                1 => KYCVerificationLevel::Basic,
+                2 => KYCVerificationLevel::Standard,
+                3 => KYCVerificationLevel::Enhanced,
+                4 => KYCVerificationLevel::Institutional,
+                _ => return Err(Error::InvalidRequest),
+            };
+
+            let config = TransferRestrictionConfig {
+                restriction_level: restriction_level_enum,
+                min_verification_level: min_level,
+                max_transfer_amount,
+                quota_period,
+                hold_period,
+                check_risk_level,
+                max_allowed_risk_level,
+            };
+
+            self.transfer_restrictions.insert(token_id, &config);
+
+            self.env().emit_event(TransferRestrictionConfigured {
+                token_id,
+                restriction_level: level_str.to_string(),
+                min_verification_level,
+                max_transfer_amount,
+            });
+
+            Ok(())
+        }
+
+        /// Gets the transfer restriction configuration for a token
+        #[ink(message)]
+        pub fn get_transfer_restrictions(
+            &self,
+            token_id: TokenId,
+        ) -> Option<(u8, u8, u128, u32, u32, bool, u8)> {
+            self.transfer_restrictions.get(token_id).map(|config| {
+                let restriction_level = match config.restriction_level {
+                    TransferRestrictionLevel::None => 0,
+                    TransferRestrictionLevel::KYCRequired => 1,
+                    TransferRestrictionLevel::VerificationLevelRequired => 2,
+                    TransferRestrictionLevel::WhitelistOnly => 3,
+                    TransferRestrictionLevel::BlacklistBased => 4,
+                };
+                let min_level = match config.min_verification_level {
+                    KYCVerificationLevel::None => 0,
+                    KYCVerificationLevel::Basic => 1,
+                    KYCVerificationLevel::Standard => 2,
+                    KYCVerificationLevel::Enhanced => 3,
+                    KYCVerificationLevel::Institutional => 4,
+                };
+                (
+                    restriction_level,
+                    min_level,
+                    config.max_transfer_amount,
+                    config.quota_period,
+                    config.hold_period,
+                    config.check_risk_level,
+                    config.max_allowed_risk_level,
+                )
+            })
+        }
+
+        /// Adds an account to the blacklist
+        #[ink(message)]
+        pub fn blacklist_account(&mut self, account: AccountId) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            self.blacklist.insert(account, &true);
+            self.env().emit_event(AccountBlacklisted {
+                account,
+                status: true,
+            });
+            Ok(())
+        }
+
+        /// Removes an account from the blacklist
+        #[ink(message)]
+        pub fn remove_from_blacklist(&mut self, account: AccountId) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            self.blacklist.remove(account);
+            self.env().emit_event(AccountBlacklisted {
+                account,
+                status: false,
+            });
+            Ok(())
+        }
+
+        /// Checks if an account is blacklisted
+        #[ink(message)]
+        pub fn is_account_blacklisted(&self, account: AccountId) -> bool {
+            self.blacklist.get(account).unwrap_or(false)
+        }
+
+        /// Adds an account to the whitelist for a specific token
+        #[ink(message)]
+        pub fn whitelist_account(
+            &mut self,
+            token_id: TokenId,
+            account: AccountId,
+        ) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            // Verify token exists
+            if self.token_owner.get(token_id).is_none() {
+                return Err(Error::TokenNotFound);
+            }
+            self.whitelist.insert((token_id, account), &true);
+            self.env().emit_event(AccountWhitelisted {
+                token_id,
+                account,
+                status: true,
+            });
+            Ok(())
+        }
+
+        /// Removes an account from the whitelist for a specific token
+        #[ink(message)]
+        pub fn remove_from_whitelist(
+            &mut self,
+            token_id: TokenId,
+            account: AccountId,
+        ) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            self.whitelist.remove((token_id, account));
+            self.env().emit_event(AccountWhitelisted {
+                token_id,
+                account,
+                status: false,
+            });
+            Ok(())
+        }
+
+        /// Checks if an account is whitelisted for a specific token
+        #[ink(message)]
+        pub fn is_account_whitelisted(&self, token_id: TokenId, account: AccountId) -> bool {
+            self.whitelist.get((token_id, account)).unwrap_or(false)
+        }
+
+        /// Gets the transfer quota status for an account and token
+        #[ink(message)]
+        pub fn get_transfer_quota_status(
+            &self,
+            token_id: TokenId,
+            account: AccountId,
+        ) -> Option<(u128, u32, u32)> {
+            self.user_transfer_quotas
+                .get((token_id, account))
+                .map(|q| (q.amount_transferred, q.period_start_block, q.acquisition_block))
+        }
+
+        /// Sets transfer restrictions for a specific token
+        #[ink(message)]
+        pub fn set_transfer_restriction(
+            &mut self,
+            token_id: TokenId,
+            restriction_level: TransferRestrictionLevel,
+            min_verification_level: KYCVerificationLevel,
+            max_transfer_amount: u128,
+            quota_period: u32,
+            hold_period: u32,
+            check_risk_level: bool,
+            max_allowed_risk_level: u8,
+        ) -> Result<(), Error> {
+            // Only admin or token owner can set restrictions
+            let caller = self.env().caller();
+            if caller != self.admin {
+                let owner = self.token_owner.get(token_id).ok_or(Error::TokenNotFound)?;
+                if caller != owner {
+                    return Err(Error::Unauthorized);
+                }
+            }
+
+            // Verify token exists
+            if self.token_owner.get(token_id).is_none() {
+                return Err(Error::TokenNotFound);
+            }
+
+            let config = TransferRestrictionConfig {
+                restriction_level,
+                min_verification_level,
+                max_transfer_amount,
+                quota_period,
+                hold_period,
+                check_risk_level,
+                max_allowed_risk_level,
+            };
+
+            self.transfer_restrictions.insert(token_id, &config);
+
+            let restriction_level_str = match restriction_level {
+                TransferRestrictionLevel::None => "None".to_string(),
+                TransferRestrictionLevel::KYCRequired => "KYCRequired".to_string(),
+                TransferRestrictionLevel::VerificationLevelRequired => "VerificationLevelRequired".to_string(),
+                TransferRestrictionLevel::WhitelistOnly => "WhitelistOnly".to_string(),
+                TransferRestrictionLevel::BlacklistBased => "BlacklistBased".to_string(),
+            };
+
+            let min_level = match min_verification_level {
+                KYCVerificationLevel::None => 0,
+                KYCVerificationLevel::Basic => 1,
+                KYCVerificationLevel::Standard => 2,
+                KYCVerificationLevel::Enhanced => 3,
+                KYCVerificationLevel::Institutional => 4,
+            };
+
+            self.env().emit_event(TransferRestrictionConfigured {
+                token_id,
+                restriction_level: restriction_level_str,
+                min_verification_level: min_level,
+                max_transfer_amount,
+            });
+
+            Ok(())
+        }
+
+        /// Gets the transfer restriction configuration for a token
+        #[ink(message)]
+        pub fn get_transfer_restriction_config(
+            &self,
+            token_id: TokenId,
+        ) -> Option<(TransferRestrictionLevel, KYCVerificationLevel, u128, u32, u32, bool, u8)> {
+            self.transfer_restrictions.get(token_id).map(|config| {
+                (
+                    config.restriction_level,
+                    config.min_verification_level,
+                    config.max_transfer_amount,
+                    config.quota_period,
+                    config.hold_period,
+                    config.check_risk_level,
+                    config.max_allowed_risk_level,
+                )
+            })
+        }
+
+        /// Removes transfer restrictions for a token
+        #[ink(message)]
+        pub fn remove_transfer_restriction(&mut self, token_id: TokenId) -> Result<(), Error> {
+            let caller = self.env().caller();
+            if caller != self.admin {
+                let owner = self.token_owner.get(token_id).ok_or(Error::TokenNotFound)?;
+                if caller != owner {
+                    return Err(Error::Unauthorized);
+                }
+            }
+
+            self.transfer_restrictions.remove(token_id);
+
+            self.env().emit_event(TransferRestrictionRemoved { token_id });
+
             Ok(())
         }
 
@@ -995,6 +1409,40 @@ pub mod property_token {
             if amount == 0 {
                 return Err(Error::InvalidAmount);
             }
+            let caller = self.env().caller();
+            if caller != from && !self.is_approved_for_all(from, caller) {
+                return Err(Error::Unauthorized);
+            }
+            if !self.pass_compliance(from)? || !self.pass_compliance(to)? {
+                return Err(Error::ComplianceFailed);
+            }
+
+            // Check KYC-based transfer restrictions for share transfers
+            self.verify_kyc_transfer(&from, &to, token_id, amount)?;
+
+            let from_balance = self.balances.get((from, token_id)).unwrap_or(0);
+            if from_balance < amount {
+                return Err(Error::InsufficientBalance);
+            }
+
+            // Update user transfer quota tracking
+            let mut quota = self.user_transfer_quotas.get((token_id, from)).unwrap_or(UserTransferQuota {
+                amount_transferred: 0,
+                period_start_block: self.env().block_number(),
+                acquisition_block: self.env().block_number(),
+            });
+
+            quota.amount_transferred = quota.amount_transferred.saturating_add(amount);
+            self.user_transfer_quotas.insert((token_id, from), &quota);
+
+            self.update_dividend_credit_on_change(from, token_id)?;
+            self.update_dividend_credit_on_change(to, token_id)?;
+            self.balances
+                .insert((from, token_id), &(from_balance.saturating_sub(amount)));
+            let to_balance = self.balances.get((to, token_id)).unwrap_or(0);
+            self.balances
+                .insert((to, token_id), &(to_balance.saturating_add(amount)));
+            Ok(())
 
             non_reentrant!(self, {
                 let caller = self.env().caller();
@@ -1497,6 +1945,303 @@ pub mod property_token {
             } else {
                 Ok(true)
             }
+        }
+
+        /// Verifies KYC-based transfer restrictions for an NFT transfer
+        fn verify_kyc_transfer(
+            &mut self,
+            from: &AccountId,
+            to: &AccountId,
+            token_id: TokenId,
+            amount: u128,
+        ) -> Result<(), Error> {
+            // Check if account is blacklisted
+            if self.blacklist.get(from).unwrap_or(false) {
+                self.env().emit_event(KYCTransferRejected {
+                    from: *from,
+                    to: *to,
+                    token_id,
+                    reason: "Sender is blacklisted".to_string(),
+                });
+                return Err(Error::AccountBlacklisted);
+            }
+
+            if self.blacklist.get(to).unwrap_or(false) {
+                self.env().emit_event(KYCTransferRejected {
+                    from: *from,
+                    to: *to,
+                    token_id,
+                    reason: "Recipient is blacklisted".to_string(),
+                });
+                return Err(Error::AccountBlacklisted);
+            }
+
+            // Get verification levels for logging
+            let from_level = self.get_kyc_verification_level(from).unwrap_or(KYCVerificationLevel::None);
+            let to_level = self.get_kyc_verification_level(to).unwrap_or(KYCVerificationLevel::None);
+
+            // Get transfer restrictions for this token
+            if let Some(config) = self.transfer_restrictions.get(token_id) {
+                // Check whitelist if enabled
+                if config.restriction_level == TransferRestrictionLevel::WhitelistOnly {
+                    if !self.whitelist.get((token_id, *from)).unwrap_or(false) {
+                        self.env().emit_event(KYCTransferRejected {
+                            from: *from,
+                            to: *to,
+                            token_id,
+                            reason: "Sender not whitelisted".to_string(),
+                        });
+                        return Err(Error::AccountNotWhitelisted);
+                    }
+                    if !self.whitelist.get((token_id, *to)).unwrap_or(false) {
+                        self.env().emit_event(KYCTransferRejected {
+                            from: *from,
+                            to: *to,
+                            token_id,
+                            reason: "Recipient not whitelisted".to_string(),
+                        });
+                        return Err(Error::AccountNotWhitelisted);
+                    }
+                }
+
+                // Check verification level if required
+                if config.restriction_level != TransferRestrictionLevel::None {
+                    if from_level < config.min_verification_level {
+                        self.env().emit_event(KYCTransferRejected {
+                            from: *from,
+                            to: *to,
+                            token_id,
+                            reason: "Sender verification level insufficient".to_string(),
+                        });
+                        return Err(Error::VerificationLevelInsufficient);
+                    }
+
+                    if to_level < config.min_verification_level {
+                        self.env().emit_event(KYCTransferRejected {
+                            from: *from,
+                            to: *to,
+                            token_id,
+                            reason: "Recipient verification level insufficient".to_string(),
+                        });
+                        return Err(Error::VerificationLevelInsufficient);
+                    }
+                }
+
+                // Check transfer quota
+                if config.max_transfer_amount > 0 {
+                    self.check_transfer_quota(from, token_id, amount, &config)?;
+                }
+
+                // Check hold period
+                if config.hold_period > 0 {
+                    self.check_hold_period(from, token_id, &config)?;
+                }
+
+                // Check risk level
+                if config.check_risk_level {
+                    self.check_risk_levels(from, to, config.max_allowed_risk_level)?;
+                }
+            }
+
+            // Convert verification levels to u8 for event
+            let from_level_u8 = match from_level {
+                KYCVerificationLevel::None => 0,
+                KYCVerificationLevel::Basic => 1,
+                KYCVerificationLevel::Standard => 2,
+                KYCVerificationLevel::Enhanced => 3,
+                KYCVerificationLevel::Institutional => 4,
+            };
+
+            let to_level_u8 = match to_level {
+                KYCVerificationLevel::None => 0,
+                KYCVerificationLevel::Basic => 1,
+                KYCVerificationLevel::Standard => 2,
+                KYCVerificationLevel::Enhanced => 3,
+                KYCVerificationLevel::Institutional => 4,
+            };
+
+            self.env().emit_event(KYCTransferVerified {
+                from: *from,
+                to: *to,
+                token_id,
+                amount,
+                from_verification_level: from_level_u8,
+                to_verification_level: to_level_u8,
+            });
+
+            // Log to KYC transfer audit log
+            let timestamp = self.env().block_timestamp();
+            let log_entry = KYCTransferEvent {
+                from: *from,
+                to: *to,
+                token_id,
+                amount,
+                timestamp,
+                from_verification_level: from_level,
+                to_verification_level: to_level,
+            };
+            self.kyc_transfer_log.insert(self.kyc_transfer_log_counter, &log_entry);
+            self.kyc_transfer_log_counter = self.kyc_transfer_log_counter.saturating_add(1);
+
+            Ok(())
+        }
+
+        /// Gets the KYC verification level for an account
+        fn get_kyc_verification_level(
+            &self,
+            account: &AccountId,
+        ) -> Result<KYCVerificationLevel, Error> {
+            let current_block = self.env().block_number();
+
+            // Check cache first (cache for 100 blocks)
+            if let Some((cached_level, cached_block)) = self.kyc_verification_cache.get(account) {
+                if current_block.saturating_sub(cached_block) < 100 {
+                    return Ok(cached_level);
+                }
+            }
+
+            // Check compliance status using the compliance registry
+            let level = if let Some(registry) = self.compliance_registry {
+                use ink::env::call::FromAccountId;
+                let checker: ink::contract_ref!(propchain_traits::ComplianceChecker) =
+                    FromAccountId::from_account_id(registry);
+                
+                // If compliant, assume Standard level; otherwise Basic
+                if checker.is_compliant(*account) {
+                    KYCVerificationLevel::Standard
+                } else {
+                    KYCVerificationLevel::Basic
+                }
+            } else {
+                // If no compliance registry, default to Basic
+                KYCVerificationLevel::Basic
+            };
+
+            Ok(level)
+        }
+
+        /// Checks risk levels from compliance registry
+        fn check_risk_levels(
+            &self,
+            from: &AccountId,
+            to: &AccountId,
+            max_allowed_risk: u8,
+        ) -> Result<(), Error> {
+            // Check compliance for both sender and recipient
+            if let Some(registry) = self.compliance_registry {
+                use ink::env::call::FromAccountId;
+                let checker: ink::contract_ref!(propchain_traits::ComplianceChecker) =
+                    FromAccountId::from_account_id(registry);
+                
+                if !checker.is_compliant(*from) {
+                    return Err(Error::HighRiskAccount);
+                }
+                if !checker.is_compliant(*to) {
+                    return Err(Error::HighRiskAccount);
+                }
+            }
+            
+            Ok(())
+        }
+
+        /// Checks transfer quota for an account
+        fn check_transfer_quota(
+            &self,
+            from: &AccountId,
+            token_id: TokenId,
+            amount: u128,
+            config: &TransferRestrictionConfig,
+        ) -> Result<(), Error> {
+            let quota = self.user_transfer_quotas.get((token_id, *from));
+            let current_block = self.env().block_number();
+
+            if let Some(mut q) = quota {
+                // Check if period has expired
+                if current_block.saturating_sub(q.period_start_block) >= config.quota_period {
+                    // New period, reset quota
+                    q.amount_transferred = 0;
+                    q.period_start_block = current_block;
+                }
+
+                // Check if adding this amount exceeds quota
+                if q.amount_transferred.saturating_add(amount) > config.max_transfer_amount {
+                    return Err(Error::TransferQuotaExceeded);
+                }
+            } else {
+                // First transfer, check against quota
+                if amount > config.max_transfer_amount {
+                    return Err(Error::TransferQuotaExceeded);
+                }
+            }
+
+            Ok(())
+        }
+
+        /// Checks hold period for an account
+        fn check_hold_period(
+            &self,
+            from: &AccountId,
+            token_id: TokenId,
+            config: &TransferRestrictionConfig,
+        ) -> Result<(), Error> {
+            if let Some(quota) = self.user_transfer_quotas.get((token_id, *from)) {
+                let current_block = self.env().block_number();
+                let blocks_held = current_block.saturating_sub(quota.acquisition_block);
+
+                if blocks_held < config.hold_period {
+                    return Err(Error::HoldPeriodNotMet);
+                }
+            }
+
+            Ok(())
+        }
+
+        /// Updates transfer quota for an account after a successful transfer
+        fn update_transfer_quota(
+            &mut self,
+            from: &AccountId,
+            to: &AccountId,
+            token_id: TokenId,
+            amount: u128,
+        ) -> Result<(), Error> {
+            let current_block = self.env().block_number();
+            let config = match self.transfer_restrictions.get(token_id) {
+                Some(cfg) => cfg,
+                None => return Ok(()), // No quota tracking if no restrictions
+            };
+
+            // Update sender's quota
+            let mut from_quota = match self.user_transfer_quotas.get((token_id, *from)) {
+                Some(q) => q,
+                None => UserTransferQuota {
+                    amount_transferred: 0,
+                    period_start_block: current_block as u32,
+                    acquisition_block: current_block as u32,
+                },
+            };
+
+            // Check if period has expired and reset if needed
+            if current_block.saturating_sub(from_quota.period_start_block as u64) >= config.quota_period as u64 {
+                from_quota.amount_transferred = 0;
+                from_quota.period_start_block = current_block as u32;
+            }
+
+            // Update amount transferred
+            from_quota.amount_transferred = from_quota.amount_transferred.saturating_add(amount);
+            self.user_transfer_quotas
+                .insert((token_id, *from), &from_quota);
+
+            // Initialize recipient's quota if first transfer to them
+            if self.user_transfer_quotas.get((token_id, *to)).is_none() {
+                let to_quota = UserTransferQuota {
+                    amount_transferred: 0,
+                    period_start_block: current_block as u32,
+                    acquisition_block: current_block as u32,
+                };
+                self.user_transfer_quotas.insert((token_id, *to), &to_quota);
+            }
+
+            Ok(())
         }
 
         fn update_dividend_credit_on_change(
@@ -3009,6 +3754,4 @@ pub mod property_token {
         }
     }
 
-    // Unit tests extracted to tests.rs (Issue #101)
-    include!("../tests.rs");
 }

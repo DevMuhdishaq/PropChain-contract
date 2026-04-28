@@ -156,6 +156,93 @@ pub struct TaxRecord {
     pub proceeds: u128,
 }
 
+/// KYC verification levels
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum KYCVerificationLevel {
+    /// No KYC verification
+    None = 0,
+    /// Basic KYC with document verification
+    Basic = 1,
+    /// Standard KYC with AML and sanctions checks
+    Standard = 2,
+    /// Enhanced KYC with biometric and risk assessment
+    Enhanced = 3,
+    /// Institutional verification with full due diligence
+    Institutional = 4,
+}
+
+/// Transfer restriction levels/types
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum TransferRestrictionLevel {
+    /// No restrictions
+    None,
+    /// Only KYC verified users can transfer
+    KYCRequired,
+    /// Requires specific verification level
+    VerificationLevelRequired,
+    /// Whitelist only transfers
+    WhitelistOnly,
+    /// Blacklist prevents transfers
+    BlacklistBased,
+}
+
+/// Per-token transfer restrictions configuration
+#[derive(
+    Debug, Clone, Copy, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct TransferRestrictionConfig {
+    /// Restriction level for this token
+    pub restriction_level: TransferRestrictionLevel,
+    /// Minimum KYC verification level required
+    pub min_verification_level: KYCVerificationLevel,
+    /// Maximum transfer amount per period (0 = unlimited)
+    pub max_transfer_amount: u128,
+    /// Period for transfer quota (in blocks)
+    pub quota_period: u32,
+    /// Minimum hold period before transfer allowed (in blocks)
+    pub hold_period: u32,
+    /// Enable risk level checking
+    pub check_risk_level: bool,
+    /// Maximum allowed risk level (0-100)
+    pub max_allowed_risk_level: u8,
+}
+
+/// User transfer quota tracking
+#[derive(
+    Debug, Clone, Copy, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct UserTransferQuota {
+    /// Total amount transferred in current period
+    pub amount_transferred: u128,
+    /// Block when the current period started
+    pub period_start_block: u32,
+    /// Block when the user first acquired this token
+    pub acquisition_block: u32,
+}
+
+/// KYC transfer event for audit logging
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct KYCTransferEvent {
+    pub from: AccountId,
+    pub to: AccountId,
+    pub token_id: TokenId,
+    pub amount: u128,
+    pub timestamp: u64,
+    pub from_verification_level: KYCVerificationLevel,
+    pub to_verification_level: KYCVerificationLevel,
+}
+
 #[derive(
     Debug,
     Clone,
@@ -189,6 +276,7 @@ pub struct VestingSchedule {
     pub cliff_duration: u64,
     pub vesting_duration: u64,
 }
+
 
 /// Snapshot for governance voting (Issue #194)
 #[derive(
