@@ -1361,6 +1361,117 @@ pub mod propchain_contracts {
             self.fee_manager
         }
 
+        fn circuit_state(&self, dependency: ExternalDependency) -> CircuitBreakerState {
+            self.external_call_breakers
+                .get(dependency)
+                .unwrap_or_default()
+        }
+
+        fn ensure_dependency_available(
+            &self,
+            dependency: ExternalDependency,
+        ) -> Result<(), Error> {
+            let state = self.circuit_state(dependency);
+            if let Some(open_until) = state.open_until {
+                if self.env().block_timestamp() < open_until {
+                    return Err(Error::ExternalDependencyUnavailable);
+                }
+            }
+            Ok(())
+        }
+
+        fn record_dependency_success(&mut self, dependency: ExternalDependency) {
+            let state = CircuitBreakerState {
+                total_failures: self.circuit_state(dependency).total_failures,
+                ..CircuitBreakerState::default()
+            };
+            self.external_call_breakers.insert(dependency, &state);
+        }
+
+        fn record_dependency_failure(&mut self, dependency: ExternalDependency) {
+            let mut state = self.circuit_state(dependency);
+            state.failure_count = state.failure_count.saturating_add(1);
+            state.total_failures = state.total_failures.saturating_add(1);
+            state.last_failure_at = Some(self.env().block_timestamp());
+            if state.failure_count >= self.external_call_config.failure_threshold {
+                state.open_until = Some(
+                    self.env()
+                        .block_timestamp()
+                        .saturating_add(self.external_call_config.cooldown_period_secs),
+                );
+            }
+            self.external_call_breakers.insert(dependency, &state);
+        }
+
+        #[ink(message)]
+        pub fn get_external_dependency_breaker(
+            &self,
+            dependency: ExternalDependency,
+        ) -> CircuitBreakerState {
+            self.circuit_state(dependency)
+        }
+
+        #[ink(message)]
+        pub fn get_external_dependency_breaker_config(&self) -> CircuitBreakerConfig {
+            self.external_call_config.clone()
+        }
+
+        #[ink(message)]
+        pub fn configure_external_dependency_breaker(
+            &mut self,
+            failure_threshold: u8,
+            cooldown_period_secs: u64,
+        ) -> Result<(), Error> {
+            if !self.ensure_admin_rbac() {
+                return Err(Error::Unauthorized);
+            }
+            if failure_threshold == 0 || cooldown_period_secs == 0 {
+                return Err(Error::ValueOutOfBounds);
+            }
+            self.external_call_config = CircuitBreakerConfig {
+                failure_threshold,
+                cooldown_period_secs,
+            };
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn trip_external_dependency_breaker(
+            &mut self,
+            dependency: ExternalDependency,
+        ) -> Result<(), Error> {
+            if !self.ensure_admin_rbac() {
+                return Err(Error::Unauthorized);
+            }
+            let mut state = self.circuit_state(dependency);
+            state.failure_count = self.external_call_config.failure_threshold;
+            state.last_failure_at = Some(self.env().block_timestamp());
+            state.open_until = Some(
+                self.env()
+                    .block_timestamp()
+                    .saturating_add(self.external_call_config.cooldown_period_secs),
+            );
+            state.total_failures = state.total_failures.saturating_add(1);
+            self.external_call_breakers.insert(dependency, &state);
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn reset_external_dependency_breaker(
+            &mut self,
+            dependency: ExternalDependency,
+        ) -> Result<(), Error> {
+            if !self.ensure_admin_rbac() {
+                return Err(Error::Unauthorized);
+            }
+            let state = CircuitBreakerState {
+                total_failures: self.circuit_state(dependency).total_failures,
+                ..CircuitBreakerState::default()
+            };
+            self.external_call_breakers.insert(dependency, &state);
+            Ok(())
+        }
+
         /// Get dynamic fee for an operation (calls fee manager if set; otherwise returns 0)
         #[ink(message)]
         pub fn get_dynamic_fee(&self, operation: FeeOperation) -> u128 {
@@ -1368,6 +1479,12 @@ pub mod propchain_contracts {
                 Some(addr) => addr,
                 None => return 0,
             };
+            if self
+                .ensure_dependency_available(ExternalDependency::FeeManager)
+                .is_err()
+            {
+                return 0;
+            }
             use ink::env::call::FromAccountId;
             let fee_manager: ink::contract_ref!(DynamicFeeProvider) =
                 FromAccountId::from_account_id(fee_manager_addr);
@@ -1523,11 +1640,12 @@ pub mod propchain_contracts {
 
         /// Helper: Check compliance for an account via the compliance registry (Issue #45).
         /// Returns Ok if compliant or no registry set, Err(NotCompliant) or Err(ComplianceCheckFailed) otherwise.
-        fn check_compliance(&self, account: AccountId) -> Result<(), Error> {
+        fn check_compliance(&mut self, account: AccountId) -> Result<(), Error> {
             let registry_addr = match self.compliance_registry {
                 Some(addr) => addr,
                 None => return Ok(()),
             };
+            self.ensure_dependency_available(ExternalDependency::ComplianceRegistry)?;
 
             use ink::env::call::FromAccountId;
             let registry: ink::contract_ref!(ComplianceChecker) =
@@ -1543,11 +1661,12 @@ pub mod propchain_contracts {
 
         /// Helper: Check identity verification and reputation requirements
         /// Returns Ok if requirements are met or no identity registry set, Err otherwise.
-        fn check_identity_requirements(&self, account: AccountId) -> Result<(), Error> {
+        fn check_identity_requirements(&mut self, account: AccountId) -> Result<(), Error> {
             let registry_addr = match self.identity_registry {
                 Some(addr) => addr,
                 None => return Ok(()),
             };
+            self.ensure_dependency_available(ExternalDependency::IdentityRegistry)?;
 
             use ink::env::call::FromAccountId;
             let registry: IdentityRegistryRef = FromAccountId::from_account_id(registry_addr);
@@ -1576,6 +1695,7 @@ pub mod propchain_contracts {
             if self.compliance_registry.is_none() {
                 return Ok(true);
             }
+            self.ensure_dependency_available(ExternalDependency::ComplianceRegistry)?;
             let registry_addr = self.compliance_registry.unwrap();
             use ink::env::call::FromAccountId;
             let registry: ink::contract_ref!(ComplianceChecker) =
@@ -4210,7 +4330,7 @@ pub mod propchain_contracts {
 
 #[cfg(test)]
 mod tests_pause {
-    use super::propchain_contracts::{Error, PropertyRegistry};
+    use super::propchain_contracts::{Error, ExternalDependency, PropertyRegistry};
     use ink::primitives::AccountId;
     use propchain_traits::PropertyMetadata;
 
@@ -4263,5 +4383,68 @@ mod tests_pause {
         // Now it should be resumed
         assert!(!contract.get_pause_state().paused);
         assert!(contract.ensure_not_paused().is_ok());
+    }
+
+    #[ink::test]
+    fn test_oracle_circuit_breaker_blocks_and_resets_external_calls() {
+        let mut contract = PropertyRegistry::new();
+        let oracle = AccountId::from([0x9; 32]);
+
+        let metadata = PropertyMetadata {
+            location: "Breaker Street".into(),
+            size: 100,
+            legal_description: "Oracle gated asset".into(),
+            valuation: 1_000,
+            documents_url: "ipfs://breaker".into(),
+        };
+        let property_id = contract
+            .register_property(metadata)
+            .expect("property registration should work");
+
+        contract
+            .set_oracle(oracle)
+            .expect("oracle address should be configurable");
+        contract
+            .trip_external_dependency_breaker(ExternalDependency::Oracle)
+            .expect("admin should be able to trip breaker");
+
+        assert_eq!(
+            contract.update_valuation_from_oracle(property_id),
+            Err(Error::ExternalDependencyUnavailable)
+        );
+
+        contract
+            .reset_external_dependency_breaker(ExternalDependency::Oracle)
+            .expect("admin should be able to reset breaker");
+        assert_ne!(
+            contract.update_valuation_from_oracle(property_id),
+            Err(Error::ExternalDependencyUnavailable)
+        );
+    }
+
+    #[ink::test]
+    fn test_compliance_circuit_breaker_blocks_registration() {
+        let mut contract = PropertyRegistry::new();
+        let registry = AccountId::from([0x7; 32]);
+
+        contract
+            .set_compliance_registry(Some(registry))
+            .expect("registry should be configurable");
+        contract
+            .trip_external_dependency_breaker(ExternalDependency::ComplianceRegistry)
+            .expect("admin should be able to trip breaker");
+
+        let metadata = PropertyMetadata {
+            location: "Compliance Road".into(),
+            size: 90,
+            legal_description: "Compliance gated asset".into(),
+            valuation: 2_000,
+            documents_url: "ipfs://compliance".into(),
+        };
+
+        assert_eq!(
+            contract.register_property(metadata),
+            Err(Error::ExternalDependencyUnavailable)
+        );
     }
 }

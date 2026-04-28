@@ -20,12 +20,14 @@ mod propchain_lending {
         PropertyNotFound,
         InsufficientCollateral,
         LoanNotFound,
+        LoanNotActive,
         PoolNotFound,
         InsufficientLiquidity,
         PositionNotFound,
         LiquidationThresholdNotMet,
         InvalidParameters,
         ProposalNotFound,
+        RestructuringNotFound,
         InsufficientVotes,
         ServicerNotFound,
         ReentrantCall,
@@ -73,6 +75,41 @@ mod propchain_lending {
     }
 
     #[derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub enum LoanStatus {
+        Pending,
+        Active,
+        RestructuringProposed,
+        Restructured,
+        Liquidated,
+    }
+
+    #[derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub enum CollateralKind {
+        Unsecured,
+        PropertyTokenized,
+    }
+
+    #[derive(
         Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
@@ -98,7 +135,23 @@ mod propchain_lending {
         pub account: AccountId,
         pub name: String,
         pub active: bool,
+        pub collateral_kind: CollateralKind,
+        pub term_months: u32,
+        pub interest_rate_bps: u32,
         pub status: LoanStatus,
+    }
+
+    #[derive(
+        Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct LoanRestructuring {
+        pub loan_id: u64,
+        pub proposed_by: AccountId,
+        pub proposed_term_months: u32,
+        pub proposed_interest_rate_bps: u32,
+        pub borrower_approved: bool,
+        pub lender_approved: bool,
     }
 
     #[derive(
@@ -133,6 +186,7 @@ mod propchain_lending {
         margin_positions: Mapping<u64, MarginPosition>,
         position_count: u64,
         loan_applications: Mapping<u64, LoanApplication>,
+        loan_restructurings: Mapping<u64, LoanRestructuring>,
         loan_count: u64,
         loan_servicers: Mapping<u64, LoanServicer>,
         servicer_count: u64,
@@ -200,6 +254,24 @@ mod propchain_lending {
         #[ink(topic)]
         loan_id: u64,
         status: String,
+    pub struct LoanRestructuringProposed {
+        #[ink(topic)]
+        loan_id: u64,
+        #[ink(topic)]
+        proposer: AccountId,
+        new_term_months: u32,
+        new_interest_rate_bps: u32,
+    }
+
+    #[ink(event)]
+    pub struct LoanRestructured {
+        #[ink(topic)]
+        loan_id: u64,
+        new_term_months: u32,
+        new_interest_rate_bps: u32,
+    }
+
+    #[ink(event)]
     pub struct LoanLiquidated {
         #[ink(topic)]
         loan_id: u64,
@@ -226,6 +298,7 @@ mod propchain_lending {
                 margin_positions: Mapping::default(),
                 position_count: 0,
                 loan_applications: Mapping::default(),
+                loan_restructurings: Mapping::default(),
                 loan_count: 0,
                 loan_servicers: Mapping::default(),
                 servicer_count: 0,
@@ -375,6 +448,33 @@ mod propchain_lending {
             collateral_value: u128,
             credit_score: u32,
         ) -> Result<u64, LendingError> {
+            self.apply_for_loan_with_terms(
+                property_id,
+                requested_amount,
+                collateral_value,
+                credit_score,
+                12,
+                800,
+            )
+        }
+
+        #[ink(message)]
+        pub fn apply_for_loan_with_terms(
+            &mut self,
+            property_id: u64,
+            requested_amount: u128,
+            collateral_value: u128,
+            credit_score: u32,
+            term_months: u32,
+            interest_rate_bps: u32,
+        ) -> Result<u64, LendingError> {
+            if requested_amount == 0
+                || collateral_value == 0
+                || term_months == 0
+                || interest_rate_bps == 0
+            {
+                return Err(LendingError::InvalidParameters);
+            }
             self.loan_count += 1;
             let app = LoanApplication {
                 loan_id: self.loan_count,
@@ -387,6 +487,48 @@ mod propchain_lending {
                 servicer_id: None,
                 servicing_reference: String::new(),
                 servicing_status: String::from("Pending"),
+                collateral_kind: CollateralKind::Unsecured,
+                term_months,
+                interest_rate_bps,
+                status: LoanStatus::Pending,
+            };
+            self.loan_applications.insert(self.loan_count, &app);
+            Ok(self.loan_count)
+        }
+
+        #[ink(message)]
+        pub fn apply_for_property_backed_loan(
+            &mut self,
+            property_id: u64,
+            requested_amount: u128,
+            credit_score: u32,
+            term_months: u32,
+            interest_rate_bps: u32,
+        ) -> Result<u64, LendingError> {
+            let record = self
+                .collateral_records
+                .get(property_id)
+                .ok_or(LendingError::PropertyNotFound)?;
+            let max_borrow = (record.assessed_value * record.ltv_ratio as u128) / 10000;
+            if requested_amount == 0
+                || term_months == 0
+                || interest_rate_bps == 0
+                || requested_amount > max_borrow
+            {
+                return Err(LendingError::InsufficientCollateral);
+            }
+
+            self.loan_count += 1;
+            let app = LoanApplication {
+                loan_id: self.loan_count,
+                applicant: self.env().caller(),
+                property_id,
+                requested_amount,
+                collateral_value: record.assessed_value,
+                credit_score,
+                collateral_kind: CollateralKind::PropertyTokenized,
+                term_months,
+                interest_rate_bps,
                 status: LoanStatus::Pending,
             };
             self.loan_applications.insert(self.loan_count, &app);
@@ -498,6 +640,44 @@ mod propchain_lending {
                 loan_id,
                 servicer_id,
                 external_reference,
+        pub fn propose_loan_restructuring(
+            &mut self,
+            loan_id: u64,
+            new_term_months: u32,
+            new_interest_rate_bps: u32,
+        ) -> Result<(), LendingError> {
+            let caller = self.env().caller();
+            if new_term_months == 0 || new_interest_rate_bps == 0 {
+                return Err(LendingError::InvalidParameters);
+            }
+
+            let mut app = self
+                .loan_applications
+                .get(loan_id)
+                .ok_or(LendingError::LoanNotFound)?;
+            if app.status != LoanStatus::Active && app.status != LoanStatus::Restructured {
+                return Err(LendingError::LoanNotActive);
+            }
+            if caller != app.applicant && caller != self.admin {
+                return Err(LendingError::Unauthorized);
+            }
+
+            let restructuring = LoanRestructuring {
+                loan_id,
+                proposed_by: caller,
+                proposed_term_months: new_term_months,
+                proposed_interest_rate_bps: new_interest_rate_bps,
+                borrower_approved: caller == app.applicant,
+                lender_approved: caller == self.admin,
+            };
+            app.status = LoanStatus::RestructuringProposed;
+            self.loan_applications.insert(loan_id, &app);
+            self.loan_restructurings.insert(loan_id, &restructuring);
+            self.env().emit_event(LoanRestructuringProposed {
+                loan_id,
+                proposer: caller,
+                new_term_months,
+                new_interest_rate_bps,
             });
             Ok(())
         }
@@ -528,6 +708,46 @@ mod propchain_lending {
             self.loan_applications.insert(loan_id, &loan);
             self.env()
                 .emit_event(LoanServicingStatusUpdated { loan_id, status });
+        pub fn approve_loan_restructuring(&mut self, loan_id: u64) -> Result<bool, LendingError> {
+            let caller = self.env().caller();
+            let mut app = self
+                .loan_applications
+                .get(loan_id)
+                .ok_or(LendingError::LoanNotFound)?;
+            let mut restructuring = self
+                .loan_restructurings
+                .get(loan_id)
+                .ok_or(LendingError::RestructuringNotFound)?;
+
+            if caller == app.applicant {
+                restructuring.borrower_approved = true;
+            } else if caller == self.admin {
+                restructuring.lender_approved = true;
+            } else {
+                return Err(LendingError::Unauthorized);
+            }
+
+            let approved = restructuring.borrower_approved && restructuring.lender_approved;
+            if approved {
+                app.term_months = restructuring.proposed_term_months;
+                app.interest_rate_bps = restructuring.proposed_interest_rate_bps;
+                app.status = LoanStatus::Restructured;
+                self.loan_applications.insert(loan_id, &app);
+                self.loan_restructurings.remove(loan_id);
+                self.env().emit_event(LoanRestructured {
+                    loan_id,
+                    new_term_months: app.term_months,
+                    new_interest_rate_bps: app.interest_rate_bps,
+                });
+            } else {
+                self.loan_restructurings.insert(loan_id, &restructuring);
+                self.loan_applications.insert(loan_id, &app);
+            }
+
+            Ok(approved)
+        }
+
+        #[ink(message)]
         pub fn liquidate_loan(
             &mut self,
             loan_id: u64,
@@ -667,6 +887,8 @@ mod propchain_lending {
         #[ink(message)]
         pub fn get_loan_servicer(&self, servicer_id: u64) -> Option<LoanServicer> {
             self.loan_servicers.get(servicer_id)
+        pub fn get_loan_restructuring(&self, loan_id: u64) -> Option<LoanRestructuring> {
+            self.loan_restructurings.get(loan_id)
         }
 
         #[ink(message)]
@@ -783,6 +1005,33 @@ mod tests {
         assert_eq!(
             contract.get_loan(loan_id).unwrap().servicing_status,
             "Current"
+    fn test_property_backed_loan_uses_assessed_collateral() {
+        let mut contract = setup();
+        contract
+            .assess_collateral(7, 2_000_000, 7000, 8500)
+            .unwrap();
+
+        let loan_id = contract
+            .apply_for_property_backed_loan(7, 1_200_000, 710, 24, 650)
+            .unwrap();
+        let loan = contract.get_loan(loan_id).unwrap();
+
+        assert_eq!(loan.collateral_value, 2_000_000);
+        assert_eq!(loan.term_months, 24);
+        assert_eq!(loan.interest_rate_bps, 650);
+        assert_eq!(loan.status, LoanStatus::Pending);
+    }
+
+    #[ink::test]
+    fn test_property_backed_loan_rejects_excessive_borrow() {
+        let mut contract = setup();
+        contract
+            .assess_collateral(9, 1_000_000, 6500, 8500)
+            .unwrap();
+
+        assert_eq!(
+            contract.apply_for_property_backed_loan(9, 700_000, 700, 12, 700),
+            Err(LendingError::InsufficientCollateral)
         );
     }
 
@@ -823,6 +1072,36 @@ mod tests {
             contract.assign_loan_servicer(loan_id, servicer_id, String::from("EXT-456")),
             Err(LendingError::Unauthorized)
         );
+    fn test_loan_restructuring_requires_borrower_and_lender_approval() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let loan_id = contract
+            .apply_for_loan_with_terms(1, 600_000, 1_000_000, 720, 12, 900)
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        assert!(contract.underwrite_loan(loan_id).unwrap());
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        assert!(contract
+            .propose_loan_restructuring(loan_id, 24, 700)
+            .is_ok());
+        let pending = contract.get_loan(loan_id).unwrap();
+        assert_eq!(pending.status, LoanStatus::RestructuringProposed);
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        assert!(contract.approve_loan_restructuring(loan_id).unwrap());
+
+        let updated = contract.get_loan(loan_id).unwrap();
+        assert_eq!(updated.term_months, 24);
+        assert_eq!(updated.interest_rate_bps, 700);
+        assert_eq!(updated.status, LoanStatus::Restructured);
+        assert!(contract.get_loan_restructuring(loan_id).is_none());
+    }
+
+    #[ink::test]
     fn test_liquidate_loan() {
         let mut contract = setup();
         contract
