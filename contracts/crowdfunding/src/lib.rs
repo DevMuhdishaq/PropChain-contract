@@ -302,10 +302,12 @@ mod propchain_crowdfunding {
     }
 
     #[ink(event)]
-    pub struct AccreditationVerified {
+    pub struct CampaignShared {
         #[ink(topic)]
-        investor: AccountId,
-        verified_by: AccountId,
+        campaign_id: u64,
+        #[ink(topic)]
+        sharer: AccountId,
+        platform: String,
     }
 
     impl RealEstateCrowdfunding {
@@ -1365,5 +1367,30 @@ mod tests {
         assert_eq!(metrics.released_milestones, 1);
         assert_eq!(metrics.released_capital, 40_000);
         assert!(!metrics.is_funded);
+    }
+
+    #[ink::test]
+    fn test_share_campaign() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        
+        let campaign_id = contract
+            .create_campaign("Viral Project".into(), 500_000)
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        assert!(contract.share_campaign(campaign_id, "Twitter".into()).is_ok());
+
+        let emitted_events = test::recorded_events().count();
+        assert_eq!(emitted_events, 2); // CampaignCreated + CampaignShared
+    }
+
+    #[ink::test]
+    fn test_share_nonexistent_campaign_fails() {
+        let contract = setup();
+        assert_eq!(
+            contract.share_campaign(999, "Facebook".into()),
+            Err(CrowdfundingError::CampaignNotFound)
+        );
     }
 }
