@@ -485,6 +485,44 @@ pub mod propchain_identity {
         timestamp: u64,
     }
 
+    /// Emitted when a KYC verification has expired
+    #[ink(event)]
+    pub struct KycExpired {
+        #[ink(topic)]
+        account: AccountId,
+        expired_at: u64,
+        timestamp: u64,
+    }
+
+    /// Emitted when KYC renewal is required (approaching expiry)
+    #[ink(event)]
+    pub struct KycRenewalRequired {
+        #[ink(topic)]
+        account: AccountId,
+        expires_at: u64,
+        timestamp: u64,
+    }
+
+    /// Emitted when a DID document is updated
+    #[ink(event)]
+    pub struct DIDUpdated {
+        #[ink(topic)]
+        account: AccountId,
+        #[ink(topic)]
+        did: String,
+        version: u32,
+        timestamp: u64,
+    }
+
+    /// Emitted when a ZK KYC proof is verified
+    #[ink(event)]
+    pub struct ZkKycVerified {
+        #[ink(topic)]
+        account: AccountId,
+        proof_type: String,
+        timestamp: u64,
+    }
+
     impl Default for IdentityRegistry {
         fn default() -> Self {
             Self {
