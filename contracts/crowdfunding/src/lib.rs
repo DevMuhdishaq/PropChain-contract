@@ -35,6 +35,7 @@ mod propchain_crowdfunding {
         CampaignNotFailed,
         AlreadyRefunded,
         NoInvestmentFound,
+        AccreditationNotVerified,
     }
 
     impl From<propchain_traits::ReentrancyError> for CrowdfundingError {
@@ -404,6 +405,37 @@ mod propchain_crowdfunding {
             Ok(())
         }
 
+        /// Admin-only: verify an investor's accreditation status
+        #[ink(message)]
+        pub fn verify_accreditation(
+            &mut self,
+            investor: AccountId,
+        ) -> Result<(), CrowdfundingError> {
+            if self.env().caller() != self.admin {
+                return Err(CrowdfundingError::Unauthorized);
+            }
+            let mut profile = self
+                .investor_profiles
+                .get(investor)
+                .ok_or(CrowdfundingError::InvestorNotCompliant)?;
+            profile.accredited = true;
+            self.investor_profiles.insert(investor, &profile);
+            self.env().emit_event(AccreditationVerified {
+                investor,
+                verified_by: self.env().caller(),
+            });
+            Ok(())
+        }
+
+        /// Query whether an investor is accredited
+        #[ink(message)]
+        pub fn is_accredited(&self, investor: AccountId) -> bool {
+            self.investor_profiles
+                .get(investor)
+                .map(|p| p.accredited)
+                .unwrap_or(false)
+        }
+
         #[ink(message)]
         pub fn invest(&mut self, campaign_id: u64, amount: u128) -> Result<(), CrowdfundingError> {
             let caller = self.env().caller();
@@ -413,6 +445,9 @@ mod propchain_crowdfunding {
                 .ok_or(CrowdfundingError::InvestorNotCompliant)?;
             if profile.kyc_status != ComplianceStatus::Approved {
                 return Err(CrowdfundingError::InvestorNotCompliant);
+            }
+            if !profile.accredited {
+                return Err(CrowdfundingError::AccreditationNotVerified);
             }
             if self.blocked_jurisdictions.contains(&profile.jurisdiction) {
                 return Err(CrowdfundingError::InvestorNotCompliant);
@@ -946,11 +981,35 @@ mod tests {
             .create_campaign("Sunset Villas".into(), 100_000)
             .unwrap();
         contract.activate_campaign(campaign_id).unwrap();
+        // Bob onboards (accredited=false until admin verifies)
         test::set_caller::<DefaultEnvironment>(accounts.bob);
-        contract.onboard_investor("US".into(), true).unwrap();
+        contract.onboard_investor("US".into(), false).unwrap();
+        // Admin (alice) verifies accreditation
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract.verify_accreditation(accounts.bob).unwrap();
+        assert!(contract.is_accredited(accounts.bob));
+        // Bob can now invest
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
         assert!(contract.invest(campaign_id, 100_000).is_ok());
         let campaign = contract.get_campaign(campaign_id).unwrap();
         assert_eq!(campaign.status, CampaignStatus::Funded);
+    }
+
+    #[ink::test]
+    fn test_invest_rejected_without_accreditation() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let campaign_id = contract
+            .create_campaign("Sunset Villas".into(), 100_000)
+            .unwrap();
+        contract.activate_campaign(campaign_id).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        contract.onboard_investor("US".into(), false).unwrap();
+        // Bob has not been accredited by admin — invest must fail
+        assert_eq!(
+            contract.invest(campaign_id, 50_000),
+            Err(CrowdfundingError::AccreditationNotVerified)
+        );
     }
 
     #[ink::test]
@@ -1016,7 +1075,10 @@ mod tests {
             .unwrap();
         contract.activate_campaign(campaign_id).unwrap();
         test::set_caller::<DefaultEnvironment>(accounts.bob);
-        contract.onboard_investor("US".into(), true).unwrap();
+        contract.onboard_investor("US".into(), false).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract.verify_accreditation(accounts.bob).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
         contract.invest(campaign_id, 40_000).unwrap();
         // Admin marks campaign as failed
         test::set_caller::<DefaultEnvironment>(accounts.alice);
@@ -1037,7 +1099,10 @@ mod tests {
             .unwrap();
         contract.activate_campaign(campaign_id).unwrap();
         test::set_caller::<DefaultEnvironment>(accounts.bob);
-        contract.onboard_investor("US".into(), true).unwrap();
+        contract.onboard_investor("US".into(), false).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract.verify_accreditation(accounts.bob).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
         contract.invest(campaign_id, 40_000).unwrap();
         // Refund should fail for active campaign
         assert_eq!(
@@ -1055,7 +1120,10 @@ mod tests {
             .unwrap();
         contract.activate_campaign(campaign_id).unwrap();
         test::set_caller::<DefaultEnvironment>(accounts.bob);
-        contract.onboard_investor("US".into(), true).unwrap();
+        contract.onboard_investor("US".into(), false).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract.verify_accreditation(accounts.bob).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
         contract.invest(campaign_id, 40_000).unwrap();
         test::set_caller::<DefaultEnvironment>(accounts.alice);
         contract.fail_campaign(campaign_id).unwrap();
