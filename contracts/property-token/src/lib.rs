@@ -110,6 +110,20 @@ pub mod property_token {
         snapshot_counter: Mapping<TokenId, u64>,
         snapshots: Mapping<(TokenId, u64), Snapshot>,
         account_snapshots: Mapping<(AccountId, TokenId, u64), u128>, // (account, token_id, snapshot_id) -> balance
+
+        // Staking fields (Issue #197)
+        /// Staking information per (staker, token_id)
+        share_stakes: Mapping<(AccountId, TokenId), ShareStakeInfo>,
+        /// Total staked shares per token
+        share_total_staked: Mapping<TokenId, u128>,
+        /// Accumulated reward per share (scaled by STAKE_SCALING)
+        share_acc_reward_per_share: Mapping<TokenId, u128>,
+        /// Last block number when rewards were calculated
+        share_last_reward_block: Mapping<TokenId, u64>,
+        /// Reward rate in basis points per year
+        share_reward_rate_bps: Mapping<TokenId, u128>,
+        /// Reward pool balance per token
+        share_reward_pool: Mapping<TokenId, u128>,
     }
 
     // Data types extracted to types.rs (Issue #101)
@@ -578,6 +592,13 @@ pub mod property_token {
                 snapshot_counter: Mapping::default(),
                 snapshots: Mapping::default(),
                 account_snapshots: Mapping::default(),
+                // Staking fields (Issue #197)
+                share_stakes: Mapping::default(),
+                share_total_staked: Mapping::default(),
+                share_acc_reward_per_share: Mapping::default(),
+                share_last_reward_block: Mapping::default(),
+                share_reward_rate_bps: Mapping::default(),
+                share_reward_pool: Mapping::default(),
             }
         }
 
