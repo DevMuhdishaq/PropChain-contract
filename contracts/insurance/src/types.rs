@@ -1,4 +1,80 @@
 // Data types for the insurance contract (Issue #101 - extracted from lib.rs)
+// Parametric insurance types added for Issue #249
+
+/// The comparison operator used to evaluate oracle data against a trigger threshold.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum TriggerComparison {
+    /// Payout when oracle value >= threshold (e.g. flood depth >= 2m)
+    GreaterThanOrEqual,
+    /// Payout when oracle value <= threshold (e.g. temperature <= -10°C)
+    LessThanOrEqual,
+}
+
+/// Status of a parametric policy.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum ParametricPolicyStatus {
+    Active,
+    Triggered,
+    Expired,
+    Cancelled,
+}
+
+/// A parametric insurance policy that pays out automatically when an oracle
+/// reports a value that crosses the defined trigger threshold.
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct ParametricPolicy {
+    pub policy_id: u64,
+    pub property_id: u64,
+    pub policyholder: AccountId,
+    /// Human-readable label for the metric being tracked (e.g. "flood_depth_cm")
+    pub metric: String,
+    /// The threshold value (scaled integer, e.g. centimetres or tenths of a degree)
+    pub trigger_threshold: i128,
+    pub comparison: TriggerComparison,
+    /// Full coverage amount paid out automatically when triggered
+    pub coverage_amount: u128,
+    /// Premium paid upfront
+    pub premium_amount: u128,
+    pub pool_id: u64,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub status: ParametricPolicyStatus,
+}
+
+/// An oracle data submission that may trigger parametric payouts.
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct OracleDataPoint {
+    pub data_id: u64,
+    pub property_id: u64,
+    pub metric: String,
+    pub value: i128,
+    pub submitted_by: AccountId,
+    pub submitted_at: u64,
+}
 
 #[derive(
     Debug,
@@ -161,9 +237,37 @@ pub struct PremiumCalculation {
     pub base_rate: u32,
     pub risk_multiplier: u32,
     pub coverage_multiplier: u32,
+    pub pool_utilization_multiplier: u32,
+    pub time_multiplier: u32,
+    pub discount_multiplier: u32,
     pub annual_premium: u128,
     pub monthly_premium: u128,
     pub deductible: u128,
+    pub breakdown: PremiumBreakdown,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct PremiumBreakdown {
+    pub base_premium: u128,
+    pub risk_adjustment: u128,
+    pub coverage_adjustment: u128,
+    pub pool_adjustment: u128,
+    pub time_adjustment: u128,
+    pub discount_amount: u128,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct PremiumModifiers {
+    pub has_multiple_policies: bool,
+    pub claim_free_years: u32,
+    pub has_safety_features: bool,
+    pub loyalty_years: u32,
 }
 
 #[derive(
@@ -175,6 +279,7 @@ pub struct ReinsuranceAgreement {
     pub reinsurer: AccountId,
     pub coverage_limit: u128,
     pub retention_limit: u128,
+    /// Basis points of premium to cede (e.g. 2000 = 20%). Used for QuotaShare.
     pub premium_ceded_rate: u32,
     pub coverage_types: Vec<CoverageType>,
     pub start_time: u64,
@@ -182,6 +287,12 @@ pub struct ReinsuranceAgreement {
     pub is_active: bool,
     pub total_ceded_premiums: u128,
     pub total_recoveries: u128,
+    /// How risk is distributed with this reinsurer
+    pub treaty_type: ReinsuranceTreatyType,
+    /// Running count of premium cessions under this agreement
+    pub cession_count: u64,
+    /// Running count of loss recoveries under this agreement
+    pub recovery_count: u64,
 }
 
 #[derive(
@@ -242,16 +353,13 @@ pub struct PoolLiquidityProvider {
 }
 
 // =========================================================================
-// CLAIM AUTOMATION (oracle-triggered parametric claims)
+// REINSURANCE DISTRIBUTION TYPES
 // =========================================================================
 
-/// Metric type an oracle can report against. Units are policy-specific and
-/// must match what the oracle is configured to publish (e.g. wind speed in
-/// km/h, magnitude * 100, etc.).
+/// Treaty type determines how risk is shared with the reinsurer
 #[derive(
     Debug,
     Clone,
-    Copy,
     PartialEq,
     Eq,
     scale::Encode,
@@ -259,71 +367,55 @@ pub struct PoolLiquidityProvider {
     ink::storage::traits::StorageLayout,
 )]
 #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
-pub enum TriggerMetric {
-    WindSpeed,
-    FloodLevel,
-    EarthquakeMagnitude,
-    Temperature,
-    Generic,
+pub enum ReinsuranceTreatyType {
+    /// Quota Share: cede a fixed % of every premium and claim
+    QuotaShare,
+    /// Excess of Loss: reinsurer covers losses above a retention threshold
+    ExcessOfLoss,
+    /// Surplus: cede the portion of risk exceeding the insurer's line
+    Surplus,
 }
 
-/// How the observed value is compared to the threshold.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    scale::Encode,
-    scale::Decode,
-    ink::storage::traits::StorageLayout,
-)]
-#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
-pub enum TriggerComparator {
-    GreaterOrEqual,
-    LessOrEqual,
-}
-
-/// How the gross claim amount is computed once a trigger fires.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    scale::Encode,
-    scale::Decode,
-    ink::storage::traits::StorageLayout,
-)]
-#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
-pub enum PayoutMode {
-    /// Fixed payout amount, capped at remaining coverage.
-    Fixed(u128),
-    /// Percentage of remaining coverage, in basis points (0–10000).
-    PercentBps(u32),
-    /// Pay out the full remaining coverage.
-    FullCoverage,
-}
-
-/// A condition registered against a policy. When an authorized oracle reports
-/// a value that satisfies the comparator/threshold, a claim is automatically
-/// created, approved, and paid.
+/// Tracks a single premium cession event for audit purposes
 #[derive(
     Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
 )]
 #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
-pub struct ClaimTrigger {
-    pub trigger_id: u64,
+pub struct PremiumCession {
+    pub cession_id: u64,
+    pub agreement_id: u64,
     pub policy_id: u64,
-    pub metric: TriggerMetric,
-    pub comparator: TriggerComparator,
-    pub threshold: u128,
-    pub payout_mode: PayoutMode,
-    pub is_active: bool,
-    pub triggered: bool,
-    pub last_observed_value: Option<u128>,
-    pub last_report_url: String,
-    pub created_at: u64,
-    pub triggered_at: Option<u64>,
-    pub triggering_claim_id: Option<u64>,
+    pub gross_premium: u128,
+    pub ceded_premium: u128,
+    pub ceded_at: u64,
+}
+
+/// Tracks a single loss recovery request from a reinsurer
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct LossRecovery {
+    pub recovery_id: u64,
+    pub agreement_id: u64,
+    pub claim_id: u64,
+    pub gross_loss: u128,
+    pub recovered_amount: u128,
+    pub recovered_at: u64,
+}
+
+/// Summary statistics for a reinsurance agreement
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct ReinsuranceStats {
+    pub agreement_id: u64,
+    pub treaty_type: ReinsuranceTreatyType,
+    pub total_ceded_premiums: u128,
+    pub total_recoveries: u128,
+    pub cession_count: u64,
+    pub recovery_count: u64,
+    /// Net position: recoveries - ceded_premiums (can be negative conceptually, stored as i128)
+    pub net_recovery: i128,
 }
