@@ -14,17 +14,6 @@ mod tax_compliance {
 
     const BASIS_POINTS_DENOMINATOR: Balance = 10_000;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
-    #[cfg_attr(
-        feature = "std",
-        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
-    )]
-    pub struct Jurisdiction {
-        pub code: u32,
-        pub country_code: [u8; 2],
-        pub region_code: u16,
-        pub locality_code: u16,
-    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
     #[cfg_attr(
@@ -194,6 +183,28 @@ mod tax_compliance {
         pub penalty_basis_points: u32,
         pub requires_reporting: bool,
         pub requires_legal_documents: bool,
+        pub withholding_rate_basis_points: u32,
+        pub tax_collector: AccountId,
+        pub active: bool,
+    }
+
+    /// A bilateral tax treaty between two jurisdictions that reduces the effective
+    /// tax rate for cross-border transactions.
+    /// `reduction_basis_points` is the percentage-point reduction applied to the
+    /// computed `tax_due` (e.g. 2000 = 20 % reduction).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub struct TaxTreaty {
+        /// Jurisdiction code of the first party (source country).
+        pub jurisdiction_a: u32,
+        /// Jurisdiction code of the second party (residence country).
+        pub jurisdiction_b: u32,
+        /// Reduction applied to the computed tax, in basis points (max 10 000).
+        pub reduction_basis_points: u32,
+        /// Whether this treaty is currently active.
         pub active: bool,
     }
 
@@ -305,6 +316,7 @@ mod tax_compliance {
         InactiveRule,
         InvalidRate,
         ReentrantCall,
+        TreatyNotFound,
     }
 
     impl From<ReentrancyError> for Error {
@@ -323,6 +335,7 @@ mod tax_compliance {
                 Self::InactiveRule => write!(f, "Tax rule is inactive"),
                 Self::InvalidRate => write!(f, "Tax configuration is invalid"),
                 Self::ReentrantCall => write!(f, "Reentrant call"),
+                Self::TreatyNotFound => write!(f, "Tax treaty not found"),
             }
         }
     }
@@ -349,6 +362,9 @@ mod tax_compliance {
                     propchain_traits::errors::compliance_codes::COMPLIANCE_CHECK_FAILED
                 }
                 Self::ReentrantCall => propchain_traits::errors::compliance_codes::REENTRANT_CALL,
+                Self::TreatyNotFound => {
+                    propchain_traits::errors::compliance_codes::COMPLIANCE_CHECK_FAILED
+                }
             }
         }
 
@@ -367,6 +383,7 @@ mod tax_compliance {
                     "The configured tax rate exceeds the supported deterministic bounds"
                 }
                 Self::ReentrantCall => "Reentrancy guard detected a reentrant call",
+                Self::TreatyNotFound => "No tax treaty was configured for the requested jurisdiction pair",
             }
         }
 
@@ -455,6 +472,16 @@ mod tax_compliance {
     }
 
     #[ink(event)]
+    pub struct TaxWithheld {
+        #[ink(topic)]
+        pub property_id: u64,
+        #[ink(topic)]
+        pub jurisdiction_code: u32,
+        pub amount: Balance,
+        pub collector: AccountId,
+    }
+
+    #[ink(event)]
     pub struct TaxDocumentVerified {
         #[ink(topic)]
         property_id: u64,
@@ -479,6 +506,17 @@ mod tax_compliance {
         advisor_id: AccountId,
         #[ink(topic)]
         property_id: u64,
+    }
+
+    /// Emitted when a tax treaty is created or updated
+    #[ink(event)]
+    pub struct TaxTreatyConfigured {
+        #[ink(topic)]
+        jurisdiction_a: u32,
+        #[ink(topic)]
+        jurisdiction_b: u32,
+        reduction_basis_points: u32,
+        active: bool,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, scale::Encode, scale::Decode)]
@@ -544,6 +582,8 @@ mod tax_compliance {
         tax_document_count: Mapping<(u64, u32, u64), u64>,
         tax_advisors: Mapping<AccountId, TaxAdvisor>,
         advisor_property_assignments: Mapping<(AccountId, u64), bool>,
+        /// Tax treaties keyed by (min(a,b), max(a,b)) for canonical ordering
+        tax_treaties: Mapping<(u32, u32), TaxTreaty>,
     }
 
     impl TaxComplianceModule {
@@ -564,6 +604,7 @@ mod tax_compliance {
                 tax_document_count: Mapping::default(),
                 tax_advisors: Mapping::default(),
                 advisor_property_assignments: Mapping::default(),
+                tax_treaties: Mapping::default(),
             }
         }
 
@@ -676,6 +717,7 @@ mod tax_compliance {
             &mut self,
             property_id: u64,
             jurisdiction: Jurisdiction,
+            residence_jurisdiction_code: Option<u32>,
         ) -> Result<TaxRecord> {
             non_reentrant!(self, {
                 self.ensure_admin()?;
@@ -685,27 +727,55 @@ mod tax_compliance {
                     .property_assessments
                     .get((property_id, jurisdiction.code))
                     .ok_or(Error::AssessmentNotFound)?;
-                let existing = self.tax_records.get((
-                    property_id,
-                    jurisdiction.code,
-                    self.reporting_period(now, rule.reporting_frequency),
-                ));
-                let profile = self.jurisdiction_profiles.get(jurisdiction.code);
-
-                let (record, _breakdown) = tax_engine::calculate_tax_record(
-                    property_id,
-                    jurisdiction.code,
-                    rule,
-                    profile,
-                    assessment,
-                    existing,
-                    now,
-                );
-
-                self.tax_records.insert(
-                    (property_id, jurisdiction.code, record.reporting_period),
-                    &record,
-                );
+                let reporting_period = self.reporting_period(now, rule.reporting_frequency);
+                let existing =
+                    self.tax_records
+                        .get((property_id, jurisdiction.code, reporting_period));
+                let combined_exemption = rule
+                    .exemption_amount
+                    .saturating_add(assessment.exemption_override);
+                let taxable_value = assessment.assessed_value.saturating_sub(combined_exemption);
+                let base_tax = taxable_value.saturating_mul(rule.rate_basis_points as Balance)
+                    / BASIS_POINTS_DENOMINATOR;
+                let gross_tax = base_tax.saturating_add(rule.fixed_charge);
+                // Apply treaty reduction if a residence jurisdiction is provided and an
+                // active treaty exists between the two jurisdictions.
+                let treaty_reduction = residence_jurisdiction_code
+                    .and_then(|res| {
+                        self.tax_treaties
+                            .get(Self::treaty_key(jurisdiction.code, res))
+                    })
+                    .filter(|t| t.active)
+                    .map(|t| {
+                        gross_tax.saturating_mul(t.reduction_basis_points as Balance)
+                            / BASIS_POINTS_DENOMINATOR
+                    })
+                    .unwrap_or(0);
+                let tax_due = gross_tax.saturating_sub(treaty_reduction);
+                let mut record = TaxRecord {                    property_id,
+                    jurisdiction_code: jurisdiction.code,
+                    reporting_period,
+                    assessed_value: assessment.assessed_value,
+                    taxable_value,
+                    tax_due,
+                    paid_amount: existing
+                        .map(|value: TaxRecord| value.paid_amount)
+                        .unwrap_or(0),
+                    due_at: now.saturating_add(rule.payment_due_period),
+                    last_payment_at: existing
+                        .map(|value: TaxRecord| value.last_payment_at)
+                        .unwrap_or(0),
+                    status: TaxStatus::Assessed,
+                    payment_reference: existing
+                        .map(|value: TaxRecord| value.payment_reference)
+                        .unwrap_or([0u8; 32]),
+                    report_hash: existing
+                        .map(|value: TaxRecord| value.report_hash)
+                        .unwrap_or([0u8; 32]),
+                };
+                record.status = self.resolve_status(&record, now);
+                self.tax_records
+                    .insert((property_id, jurisdiction.code, reporting_period), &record);
                 self.latest_reporting_period
                     .insert((property_id, jurisdiction.code), &record.reporting_period);
 
@@ -966,6 +1036,48 @@ mod tax_compliance {
             self.tax_rules.get(jurisdiction_code)
         }
 
+        /// Create or update a tax treaty between two jurisdictions.
+        /// `reduction_basis_points` must not exceed 10 000 (100 %).
+        #[ink(message)]
+        pub fn set_tax_treaty(
+            &mut self,
+            jurisdiction_a: u32,
+            jurisdiction_b: u32,
+            reduction_basis_points: u32,
+            active: bool,
+        ) -> Result<()> {
+            self.ensure_admin()?;
+            if reduction_basis_points > BASIS_POINTS_DENOMINATOR as u32 {
+                return Err(Error::InvalidRate);
+            }
+            let key = Self::treaty_key(jurisdiction_a, jurisdiction_b);
+            let treaty = TaxTreaty {
+                jurisdiction_a,
+                jurisdiction_b,
+                reduction_basis_points,
+                active,
+            };
+            self.tax_treaties.insert(key, &treaty);
+            self.env().emit_event(TaxTreatyConfigured {
+                jurisdiction_a,
+                jurisdiction_b,
+                reduction_basis_points,
+                active,
+            });
+            Ok(())
+        }
+
+        /// Retrieve the treaty between two jurisdictions, if one exists.
+        #[ink(message)]
+        pub fn get_tax_treaty(
+            &self,
+            jurisdiction_a: u32,
+            jurisdiction_b: u32,
+        ) -> Option<TaxTreaty> {
+            self.tax_treaties
+                .get(Self::treaty_key(jurisdiction_a, jurisdiction_b))
+        }
+
         #[ink(message)]
         pub fn get_jurisdiction_profile(&self, jurisdiction_code: u32) -> Option<JurisdictionProfile> {
             self.jurisdiction_profiles.get(jurisdiction_code)
@@ -1032,6 +1144,11 @@ mod tax_compliance {
                 return Err(Error::Unauthorized);
             }
             Ok(())
+        }
+
+        /// Canonical key for a treaty: (min, max) so order of arguments doesn't matter.
+        fn treaty_key(a: u32, b: u32) -> (u32, u32) {
+            if a <= b { (a, b) } else { (b, a) }
         }
 
         fn get_active_rule(&self, jurisdiction_code: u32) -> Result<TaxRule> {
@@ -1182,10 +1299,14 @@ mod tax_compliance {
                     verified_at: None,
                 };
 
-                self.tax_documents
-                    .insert((property_id, jurisdiction_code, reporting_period, count), &document);
-                self.tax_document_count
-                    .insert((property_id, jurisdiction_code, reporting_period), &(count + 1));
+                self.tax_documents.insert(
+                    (property_id, jurisdiction_code, reporting_period, count),
+                    &document,
+                );
+                self.tax_document_count.insert(
+                    (property_id, jurisdiction_code, reporting_period),
+                    &(count + 1),
+                );
 
                 self.env().emit_event(TaxDocumentUploaded {
                     property_id,
@@ -1223,7 +1344,12 @@ mod tax_compliance {
                 let now = self.env().block_timestamp();
                 let caller = self.env().caller();
 
-                let key = (property_id, jurisdiction_code, reporting_period, document_index);
+                let key = (
+                    property_id,
+                    jurisdiction_code,
+                    reporting_period,
+                    document_index,
+                );
                 let mut document = self.tax_documents.get(key).ok_or(Error::RecordNotFound)?;
 
                 document.verified = true;
@@ -1266,9 +1392,9 @@ mod tax_compliance {
                 .unwrap_or(0);
             let mut documents = Vec::new();
             for i in 0..count {
-                if let Some(doc) = self
-                    .tax_documents
-                    .get((property_id, jurisdiction_code, reporting_period, i))
+                if let Some(doc) =
+                    self.tax_documents
+                        .get((property_id, jurisdiction_code, reporting_period, i))
                 {
                     documents.push(doc);
                 }
@@ -1284,8 +1410,12 @@ mod tax_compliance {
             reporting_period: u64,
             document_index: u64,
         ) -> Option<TaxDocument> {
-            self.tax_documents
-                .get((property_id, jurisdiction_code, reporting_period, document_index))
+            self.tax_documents.get((
+                property_id,
+                jurisdiction_code,
+                reporting_period,
+                document_index,
+            ))
         }
 
         // ===== Tax Advisor Integration - Issue #265 =====
@@ -1410,6 +1540,52 @@ mod tax_compliance {
         }
     }
 
+    impl TaxWithholder for TaxComplianceModule {
+        #[ink(message)]
+        fn withhold_tax(
+            &mut self,
+            property_id: u64,
+            jurisdiction: Jurisdiction,
+            transaction_amount: u128,
+        ) -> (u128, AccountId) {
+            let rule = match self.get_active_rule(jurisdiction.code) {
+                Ok(r) => r,
+                Err(_) => return (0, AccountId::from([0x00; 32])),
+            };
+
+            if rule.withholding_rate_basis_points == 0 {
+                return (0, rule.tax_collector);
+            }
+
+            let withheld_amount = (transaction_amount
+                .saturating_mul(rule.withholding_rate_basis_points as u128))
+                / BASIS_POINTS_DENOMINATOR as u128;
+
+            if withheld_amount > 0 {
+                let now = self.env().block_timestamp();
+                let period = self.reporting_period(now, rule.reporting_frequency);
+
+                self.env().emit_event(TaxWithheld {
+                    property_id,
+                    jurisdiction_code: jurisdiction.code,
+                    amount: withheld_amount,
+                    collector: rule.tax_collector,
+                });
+
+                self.log_audit(
+                    property_id,
+                    jurisdiction.code,
+                    period,
+                    AuditAction::TaxPaid,
+                    withheld_amount,
+                    [0u8; 32],
+                );
+            }
+
+            (withheld_amount, rule.tax_collector)
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1433,6 +1609,8 @@ mod tax_compliance {
                 penalty_basis_points: 500,
                 requires_reporting: true,
                 requires_legal_documents: true,
+                withholding_rate_basis_points: 500, // 5%
+                tax_collector: AccountId::from([0x01; 32]),
                 active: true,
             }
         }
@@ -1449,7 +1627,7 @@ mod tax_compliance {
                 .set_property_assessment(7, jurisdiction(), owner, 200_000, 5_000)
                 .expect("assessment");
 
-            let record = contract.calculate_tax(7, jurisdiction()).expect("tax");
+            let record = contract.calculate_tax(7, jurisdiction(), None).expect("tax");
             assert_eq!(record.taxable_value, 185_000);
             assert_eq!(record.tax_due, 5_625);
             assert_eq!(record.status, TaxStatus::Assessed);
@@ -1467,7 +1645,7 @@ mod tax_compliance {
                 .set_property_assessment(8, jurisdiction(), owner, 120_000, 0)
                 .expect("assessment");
 
-            let record = contract.calculate_tax(8, jurisdiction()).expect("tax");
+            let record = contract.calculate_tax(8, jurisdiction(), None).expect("tax");
             let initial = contract
                 .check_compliance(8, jurisdiction())
                 .expect("compliance");
@@ -1510,7 +1688,7 @@ mod tax_compliance {
             contract
                 .set_property_assessment(9, jurisdiction(), owner, 100_000, 0)
                 .expect("assessment");
-            let record = contract.calculate_tax(9, jurisdiction()).expect("tax");
+            let record = contract.calculate_tax(9, jurisdiction(), None).expect("tax");
             contract
                 .record_tax_payment(
                     9,
@@ -1597,6 +1775,106 @@ mod tax_compliance {
                 .expect("remove");
 
             assert!(!contract.is_advisor_assigned(advisor_id, 15));
+        }
+
+        // ── Tax treaty tests (#267) ──────────────────────────────────────────
+
+        fn residence_jurisdiction() -> Jurisdiction {
+            Jurisdiction {
+                code: 2001,
+                country_code: *b"DE",
+                region_code: 0,
+                locality_code: 0,
+            }
+        }
+
+        #[ink::test]
+        fn set_and_get_treaty() {
+            let mut contract = TaxComplianceModule::new(None);
+            contract
+                .set_tax_treaty(1001, 2001, 2000, true)
+                .expect("set treaty");
+            let treaty = contract.get_tax_treaty(1001, 2001).expect("get treaty");
+            assert_eq!(treaty.reduction_basis_points, 2000);
+            assert!(treaty.active);
+            // Canonical key: same result regardless of argument order
+            assert_eq!(
+                contract.get_tax_treaty(2001, 1001),
+                Some(treaty)
+            );
+        }
+
+        #[ink::test]
+        fn treaty_reduces_tax_due() {
+            let mut contract = TaxComplianceModule::new(None);
+            let owner = AccountId::from([0x10; 32]);
+
+            contract.configure_tax_rule(jurisdiction(), rule()).expect("rule");
+            contract
+                .set_property_assessment(20, jurisdiction(), owner, 200_000, 5_000)
+                .expect("assessment");
+
+            // Without treaty
+            let record_no_treaty = contract
+                .calculate_tax(20, jurisdiction(), None)
+                .expect("tax no treaty");
+
+            // Set a 20 % reduction treaty
+            contract
+                .set_tax_treaty(jurisdiction().code, residence_jurisdiction().code, 2000, true)
+                .expect("treaty");
+
+            let record_with_treaty = contract
+                .calculate_tax(20, jurisdiction(), Some(residence_jurisdiction().code))
+                .expect("tax with treaty");
+
+            // tax_due should be 20 % less
+            let expected = record_no_treaty
+                .tax_due
+                .saturating_mul(8000)
+                / 10_000;
+            assert_eq!(record_with_treaty.tax_due, expected);
+            assert!(record_with_treaty.tax_due < record_no_treaty.tax_due);
+        }
+
+        #[ink::test]
+        fn inactive_treaty_has_no_effect() {
+            let mut contract = TaxComplianceModule::new(None);
+            let owner = AccountId::from([0x11; 32]);
+
+            contract.configure_tax_rule(jurisdiction(), rule()).expect("rule");
+            contract
+                .set_property_assessment(21, jurisdiction(), owner, 200_000, 0)
+                .expect("assessment");
+
+            // Inactive treaty
+            contract
+                .set_tax_treaty(jurisdiction().code, residence_jurisdiction().code, 3000, false)
+                .expect("treaty");
+
+            let record_no_treaty = contract
+                .calculate_tax(21, jurisdiction(), None)
+                .expect("no treaty");
+            let record_inactive = contract
+                .calculate_tax(21, jurisdiction(), Some(residence_jurisdiction().code))
+                .expect("inactive treaty");
+
+            assert_eq!(record_no_treaty.tax_due, record_inactive.tax_due);
+        }
+
+        #[ink::test]
+        fn set_treaty_rejects_rate_over_100_percent() {
+            let mut contract = TaxComplianceModule::new(None);
+            assert_eq!(
+                contract.set_tax_treaty(1001, 2001, 10_001, true),
+                Err(Error::InvalidRate)
+            );
+        }
+
+        #[ink::test]
+        fn no_treaty_returns_none() {
+            let contract = TaxComplianceModule::new(None);
+            assert!(contract.get_tax_treaty(1001, 9999).is_none());
         }
     }
 }
