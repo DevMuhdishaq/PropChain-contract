@@ -333,6 +333,22 @@ mod property_management {
         pub pending_screenings: u32,
     }
 
+    #[derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct Proposal {
+        pub id: u64,
+        pub votes_for: u128,
+        pub votes_against: u128,
+    }
+
     #[ink(storage)]
     pub struct PropertyManagement {
         admin: AccountId,
@@ -352,6 +368,9 @@ mod property_management {
         inspections: Mapping<u64, Inspection>,
         dispute_counter: u64,
         disputes: Mapping<u64, DisputeCase>,
+        proposal_counter: u64,
+        proposals: Mapping<u64, Proposal>,
+        proposal_votes: Mapping<(u64, AccountId), bool>,
         legal_by_token: Mapping<TokenId, JurisdictionCompliance>,
         analytics_by_token: Mapping<TokenId, PropertyAnalytics>,
         operating_float: Balance,
@@ -460,6 +479,9 @@ mod property_management {
                 inspections: Mapping::default(),
                 dispute_counter: 0,
                 disputes: Mapping::default(),
+                proposal_counter: 0,
+                proposals: Mapping::default(),
+                proposal_votes: Mapping::default(),
                 legal_by_token: Mapping::default(),
                 analytics_by_token: Mapping::default(),
                 operating_float: 0,
@@ -1151,6 +1173,48 @@ mod property_management {
                 open_disputes: self.global_open_disputes,
                 pending_screenings: self.global_pending_screenings,
             }
+        }
+
+        #[ink(message)]
+        pub fn create_proposal(&mut self) -> Result<u64, Error> {
+            self.ensure_manager_or_admin()?;
+            self.proposal_counter = self.proposal_counter.saturating_add(1);
+            let proposal = Proposal {
+                id: self.proposal_counter,
+                votes_for: 0,
+                votes_against: 0,
+            };
+            self.proposals.insert(self.proposal_counter, &proposal);
+            Ok(self.proposal_counter)
+        }
+
+        #[ink(message)]
+        pub fn vote(&mut self, proposal_id: u64, support: bool) -> Result<(), Error> {
+            let voter = self.env().caller();
+            if self.proposal_votes.get((proposal_id, voter)).unwrap_or(false) {
+                return Err(Error::InvalidStatus);
+            }
+
+            let mut proposal = self.proposals.get(proposal_id).unwrap_or(Proposal {
+                id: proposal_id,
+                votes_for: 0,
+                votes_against: 0,
+            });
+
+            if support {
+                proposal.votes_for = proposal.votes_for.saturating_add(1);
+            } else {
+                proposal.votes_against = proposal.votes_against.saturating_add(1);
+            }
+
+            self.proposals.insert(proposal_id, &proposal);
+            self.proposal_votes.insert((proposal_id, voter), &true);
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn get_proposal(&self, proposal_id: u64) -> Option<Proposal> {
+            self.proposals.get(proposal_id)
         }
 
         fn finish_dispute(&mut self, dispute_id: u64, status: DisputeStatus) -> Result<(), Error> {
