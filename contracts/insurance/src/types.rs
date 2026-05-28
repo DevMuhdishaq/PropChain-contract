@@ -521,3 +521,57 @@ pub struct ReinsuranceStats {
     /// Net position: recoveries - ceded_premiums (can be negative conceptually, stored as i128)
     pub net_recovery: i128,
 }
+
+/// The oracle metric being monitored by a claim trigger.
+#[derive(
+    Debug, Clone, PartialEq, Eq,
+    scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum TriggerMetric {
+    FloodDepthCm,
+    WindSpeedKph,
+    TemperatureCelsius,
+    RainfallMm,
+    EarthquakeMagnitude,
+}
+
+/// Comparison operator for evaluating oracle data against a trigger threshold.
+#[derive(
+    Debug, Clone, PartialEq, Eq,
+    scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum TriggerComparator {
+    GreaterOrEqual,
+    LessOrEqual,
+}
+
+/// How the payout amount is calculated when a trigger fires.
+#[derive(
+    Debug, Clone, PartialEq, Eq,
+    scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum PayoutMode {
+    Fixed(u128),
+    PercentBps(u32),
+    FullCoverage,
+}
+
+/// An oracle-driven claim trigger stored in contract state.
+#[derive(
+    Debug, Clone, PartialEq,
+    scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct ClaimTrigger {
+    pub trigger_id: u64,
+    pub policy_id: u64,
+    pub metric: TriggerMetric,
+    pub threshold: i128,
+    pub comparator: TriggerComparator,
+    pub payout_mode: PayoutMode,
+    pub active: bool,
+    pub fired: bool,
+}
