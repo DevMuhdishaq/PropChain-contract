@@ -105,18 +105,13 @@ mod governance {
         signer_public_keys: Mapping<AccountId, [u8; 33]>,
         /// Pending admin key rotation request
         pending_admin_rotation: Option<propchain_traits::KeyRotationRequest>,
-        // ── Governance Delegation (Issue #231) ────────────────────────────────
-        /// Delegations: delegator -> delegate
-        governance_delegations: Mapping<AccountId, AccountId>,
-        /// Delegated voting power to a delegate
-        delegated_power: Mapping<AccountId, u32>,
-        /// Delegation expiry: (delegator, delegate) -> expiry block
-        delegation_expiry: Mapping<(AccountId, AccountId), u64>,
-        // ── Quadratic Voting (Issue #229) ─────────────────────────────────────
-        /// Credit budget per signer (default 100)
-        signer_credits: Mapping<AccountId, u32>,
-        /// Credits already used on a specific proposal: (proposal_id, voter) -> credits
-        used_credits: Mapping<(u64, AccountId), u32>,
+        // ── Voting Privacy (Issue #234) ───────────────────────────────────────
+        /// Commitments: (proposal_id, voter) -> hashed vote commitment
+        vote_commitments: Mapping<(u64, AccountId), Hash>,
+        /// Reveal phase active: proposal_id -> bool
+        reveal_phase_started: Mapping<u64, bool>,
+        /// Reveal phase duration in blocks
+        reveal_phase_duration: u64,
     }
 
     // =========================================================================
@@ -153,11 +148,9 @@ mod governance {
                 timelock_blocks,
                 signer_public_keys: Mapping::default(),
                 pending_admin_rotation: None,
-                governance_delegations: Mapping::default(),
-                delegated_power: Mapping::default(),
-                delegation_expiry: Mapping::default(),
-                signer_credits: Mapping::default(),
-                used_credits: Mapping::default(),
+                vote_commitments: Mapping::default(),
+                reveal_phase_started: Mapping::default(),
+                reveal_phase_duration: 10_800, // ~18 hours at 6s blocks
             }
         }
 
@@ -193,18 +186,16 @@ mod governance {
             self.active_proposal_count
         }
 
-        // ── Delegation Queries (Issue #231) ───────────────────────────────────
-
-        /// Returns the delegate for a signer, if any.
+        /// Returns whether the reveal phase has started for a proposal.
         #[ink(message)]
-        pub fn get_delegate(&self, delegator: AccountId) -> Option<AccountId> {
-            self.governance_delegations.get(&delegator)
+        pub fn is_reveal_phase_started(&self, proposal_id: u64) -> bool {
+            self.reveal_phase_started.get(proposal_id).unwrap_or(false)
         }
 
-        /// Returns the delegated voting power for a delegate.
+        /// Returns whether a signer has committed a vote.
         #[ink(message)]
-        pub fn get_delegated_power(&self, delegate: AccountId) -> u32 {
-            self.delegated_power.get(&delegate).unwrap_or(0)
+        pub fn has_committed_vote(&self, proposal_id: u64, signer: AccountId) -> bool {
+            self.vote_commitments.contains((proposal_id, signer))
         }
 
         // ----- Mutations -----
@@ -522,22 +513,16 @@ mod governance {
             Ok(())
         }
 
-        // ── Quadratic Voting (Issue #229) ────────────────────────────────────
+        // ── Voting Privacy (Issue #234) ───────────────────────────────────────
 
-        /// Cast a quadratic vote on an active proposal.
-        /// Credits determine voting weight: effective_weight = sqrt(credits_to_spend).
-        /// Cost increases quadratically: weight² credits spent for weight votes.
+        /// Submit a hashed commitment for a private vote.
+        /// The commitment should be hash(proposal_id || voter || support || salt).
         #[ink(message)]
-        pub fn quadratic_vote(
-            &mut self,
-            proposal_id: u64,
-            support: bool,
-            credits_to_spend: u32,
-        ) -> Result<u32, Error> {
+        pub fn commit_vote(&mut self, proposal_id: u64, commitment: Hash) -> Result<(), Error> {
             let caller = self.env().caller();
             self.ensure_signer(caller)?;
 
-            let mut proposal = self
+            let proposal = self
                 .proposals
                 .get(proposal_id)
                 .ok_or(Error::ProposalNotFound)?;
@@ -546,181 +531,73 @@ mod governance {
                 return Err(Error::ProposalClosed);
             }
 
-            // Get or initialize credits for this signer
-            let total_credits = self.signer_credits.get(&caller).unwrap_or(100);
-            let already_used = self.used_credits.get(&(proposal_id, caller)).unwrap_or(0);
-            let remaining = total_credits.saturating_sub(already_used);
-
-            if credits_to_spend > remaining {
-                return Err(Error::InvalidThreshold);
+            if self.vote_commitments.contains((proposal_id, caller)) {
+                return Err(Error::AlreadyVoted);
             }
 
-            // Calculate voting weight = floor(sqrt(credits_to_spend))
-            let voting_weight = Self::integer_sqrt(credits_to_spend as u128) as u32;
-            if voting_weight == 0 && credits_to_spend > 0 {
-                return Err(Error::InvalidThreshold);
-            }
+            self.vote_commitments
+                .insert((proposal_id, caller), &commitment);
 
-            // Update used credits
-            let new_used = already_used.saturating_add(credits_to_spend);
-            self.used_credits.insert(&(proposal_id, caller), &new_used);
-
-            // Track previous votes to avoid double-counting
-            let existing_key = (proposal_id, caller);
-            if !self.votes.contains(existing_key) {
-                // First time voting on this proposal
-                self.votes.insert(existing_key, &support);
-                if support {
-                    proposal.votes_for = proposal.votes_for.saturating_add(voting_weight);
-                } else {
-                    proposal.votes_against = proposal.votes_against.saturating_add(voting_weight);
-                }
-            } else {
-                // Add additional weight
-                if support {
-                    proposal.votes_for = proposal.votes_for.saturating_add(voting_weight);
-                } else {
-                    proposal.votes_against = proposal.votes_against.saturating_add(voting_weight);
-                }
-            }
-
-            // Check if threshold reached
-            if proposal.votes_for >= proposal.threshold {
-                let now = self.env().block_number() as u64;
-                proposal.status = ProposalStatus::Approved;
-                if proposal.is_emergency {
-                    proposal.timelock_until = now;
-                } else {
-                    proposal.timelock_until = now.saturating_add(self.timelock_blocks);
-                }
-                self.active_proposal_count = self.active_proposal_count.saturating_sub(1);
-            }
-
-            // Check if rejection is certain
-            let total_signers = self.signers.len() as u32;
-            let total_votes = proposal.votes_for.saturating_add(proposal.votes_against);
-            let remaining_signers = total_signers.saturating_sub(1); // Approx remaining
-            if proposal.votes_for.saturating_add(remaining_signers * 100) < proposal.threshold {
-                // Rough check: even if all remaining signers max out, can't reach threshold
-                proposal.status = ProposalStatus::Rejected;
-                self.active_proposal_count = self.active_proposal_count.saturating_sub(1);
-                self.env().emit_event(ProposalRejected { proposal_id });
-            }
-
-            self.proposals.insert(proposal_id, &proposal);
-
-            self.env().emit_event(QuadraticVoteCast {
-                proposal_id,
-                voter: caller,
-                support,
-                credits_spent: credits_to_spend,
-                voting_weight,
-            });
-
-            Ok(voting_weight)
-        }
-
-        /// Returns the total credit budget for a signer.
-        #[ink(message)]
-        pub fn get_signer_credits(&self, signer: AccountId) -> u32 {
-            self.signer_credits.get(&signer).unwrap_or(100)
-        }
-
-        /// Returns the credits already used on a specific proposal by a voter.
-        #[ink(message)]
-        pub fn get_used_credits(&self, proposal_id: u64, voter: AccountId) -> u32 {
-            self.used_credits.get(&(proposal_id, voter)).unwrap_or(0)
-        }
-
-        /// Returns the remaining credits for a signer on a specific proposal.
-        #[ink(message)]
-        pub fn get_remaining_credits(&self, proposal_id: u64, voter: AccountId) -> u32 {
-            let total = self.signer_credits.get(&voter).unwrap_or(100);
-            let used = self.used_credits.get(&(proposal_id, voter)).unwrap_or(0);
-            total.saturating_sub(used)
-        }
-
-        /// Admin: set the credit budget for a signer.
-        #[ink(message)]
-        pub fn set_signer_credits(&mut self, signer: AccountId, credits: u32) -> Result<(), Error> {
-            self.ensure_admin()?;
-            if credits == 0 {
-                return Err(Error::InvalidThreshold);
-            }
-            self.signer_credits.insert(&signer, &credits);
             Ok(())
         }
 
-        /// Integer square root (floor) for quadratic voting calculation.
-        /// Uses Newton-Raphson method in no_std environment.
-        fn integer_sqrt(value: u128) -> u128 {
-            if value < 2 {
-                return value;
+        /// Start the reveal phase for a proposal (any signer may call).
+        #[ink(message)]
+        pub fn start_reveal_phase(&mut self, proposal_id: u64) -> Result<(), Error> {
+            let caller = self.env().caller();
+            self.ensure_signer(caller)?;
+
+            let proposal = self
+                .proposals
+                .get(proposal_id)
+                .ok_or(Error::ProposalNotFound)?;
+
+            if proposal.status != ProposalStatus::Active {
+                return Err(Error::ProposalClosed);
             }
-            let mut x = value;
-            let mut y = (x + 1) / 2;
-            while y < x {
-                x = y;
-                y = (x + value / x) / 2;
+
+            if self.reveal_phase_started.get(proposal_id).unwrap_or(false) {
+                return Err(Error::AlreadyVoted);
             }
-            x
+
+            self.reveal_phase_started.insert(proposal_id, &true);
+            Ok(())
         }
 
-        // ── Delegation Messages (Issue #231) ─────────────────────────────────
-
-        /// Delegate voting power to another signer.
+        /// Reveal a private vote after the commitment phase.
+        /// Verifies that the revealed vote matches the earlier commitment.
         #[ink(message)]
-        pub fn delegate_governance(
+        pub fn reveal_vote(
             &mut self,
-            delegate: AccountId,
-            expiry_blocks: Option<u64>,
+            proposal_id: u64,
+            support: bool,
+            salt: [u8; 32],
         ) -> Result<(), Error> {
             let caller = self.env().caller();
             self.ensure_signer(caller)?;
 
-            if !self.signers.contains(&delegate) {
-                return Err(Error::NotASigner);
-            }
-            if delegate == caller {
-                return Err(Error::InvalidThreshold);
+            if !self.reveal_phase_started.get(proposal_id).unwrap_or(false) {
+                return Err(Error::ProposalClosed);
             }
 
-            // Remove old delegation if exists
-            if let Some(old_delegate) = self.governance_delegations.get(&caller) {
-                let old_power = self.delegated_power.get(&old_delegate).unwrap_or(0);
-                if old_power > 0 {
-                    self.delegated_power.insert(&old_delegate, &(old_power - 1));
-                }
+            let commitment = self
+                .vote_commitments
+                .get((proposal_id, caller))
+                .ok_or(Error::AlreadyVoted)?;
+
+            // Verify the commitment matches
+            let encoded = (proposal_id, caller, support, salt);
+            let expected = self.env().hash_encoded::<ink::scale::Encode>(&encoded);
+            if commitment != expected {
+                return Err(Error::Unauthorized);
             }
 
-            self.governance_delegations.insert(&caller, &delegate);
-            let current_power = self.delegated_power.get(&delegate).unwrap_or(0);
-            self.delegated_power.insert(&delegate, &(current_power + 1));
+            // Clear commitment to prevent double-reveal
+            self.vote_commitments.remove((proposal_id, caller));
 
-            // Set expiry if provided
-            if let Some(blocks) = expiry_blocks {
-                let expiry = (self.env().block_number() as u64).saturating_add(blocks);
-                self.delegation_expiry.insert(&(caller, delegate), &expiry);
-            }
+            // Record the vote via internal logic
+            self.record_vote(proposal_id, caller, support)?;
 
-            Ok(())
-        }
-
-        /// Remove governance delegation.
-        #[ink(message)]
-        pub fn undelegate_governance(&mut self) -> Result<(), Error> {
-            let caller = self.env().caller();
-            self.ensure_signer(caller)?;
-
-            if let Some(old_delegate) = self.governance_delegations.get(&caller) {
-                let old_power = self.delegated_power.get(&old_delegate).unwrap_or(0);
-                if old_power > 0 {
-                    self.delegated_power.insert(&old_delegate, &(old_power - 1));
-                }
-                self.delegation_expiry.remove(&(caller, old_delegate));
-            }
-
-            self.governance_delegations.remove(&caller);
             Ok(())
         }
 
@@ -949,6 +826,54 @@ mod governance {
             if !self.signers.contains(&account) {
                 return Err(Error::NotASigner);
             }
+            Ok(())
+        }
+
+        /// Internal vote recording logic shared by `vote` and `reveal_vote`.
+        fn record_vote(&mut self, proposal_id: u64, caller: AccountId, support: bool) -> Result<(), Error> {
+            let mut proposal = self
+                .proposals
+                .get(proposal_id)
+                .ok_or(Error::ProposalNotFound)?;
+
+            if proposal.status != ProposalStatus::Active {
+                return Err(Error::ProposalClosed);
+            }
+
+            if self.votes.contains((proposal_id, caller)) {
+                return Err(Error::AlreadyVoted);
+            }
+
+            self.votes.insert((proposal_id, caller), &support);
+            if support {
+                proposal.votes_for = proposal.votes_for.saturating_add(1);
+            } else {
+                proposal.votes_against = proposal.votes_against.saturating_add(1);
+            }
+
+            // Check if threshold reached → move to Approved with timelock
+            if proposal.votes_for >= proposal.threshold {
+                let now = self.env().block_number() as u64;
+                proposal.status = ProposalStatus::Approved;
+                if proposal.is_emergency {
+                    proposal.timelock_until = now;
+                } else {
+                    proposal.timelock_until = now.saturating_add(self.timelock_blocks);
+                }
+                self.active_proposal_count = self.active_proposal_count.saturating_sub(1);
+            }
+
+            // Check if rejection is certain
+            let total_signers = self.signers.len() as u32;
+            let total_votes = proposal.votes_for.saturating_add(proposal.votes_against);
+            let remaining = total_signers.saturating_sub(total_votes);
+            if proposal.votes_for.saturating_add(remaining) < proposal.threshold {
+                proposal.status = ProposalStatus::Rejected;
+                self.active_proposal_count = self.active_proposal_count.saturating_sub(1);
+                self.env().emit_event(ProposalRejected { proposal_id });
+            }
+
+            self.proposals.insert(proposal_id, &proposal);
             Ok(())
         }
     }
