@@ -1700,21 +1700,26 @@ mod propchain_escrow {
 
             let average_score_bps = (total_score * 1000 / total as u64) as u32;
 
-            // Calculate reliability score (0-1000) based on rating consistency
-            let weighted_avg = total_score as f64 / total as f64;
-            let variance: f64 = {
-                let mut sum_sq = 0.0;
-                for id in 1..=total {
-                    if let Some(rating) = self.ratings.get(&(participant, id)) {
-                        let diff = rating.score as f64 - weighted_avg;
-                        sum_sq += diff * diff;
-                    }
+            // Calculate reliability score (0-1000) based on rating consistency.
+            // Uses integer arithmetic: sum absolute deviations from average
+            // in basis points, then map to 0-1000 scale (lower deviation = higher score).
+            let avg_bps = average_score_bps as u64; // average * 1000
+            let mut total_deviation_bps: u64 = 0;
+            for id in 1..=total {
+                if let Some(rating) = self.ratings.get(&(participant, id)) {
+                    let score_bps = (rating.score as u64) * 1000;
+                    let deviation = if score_bps > avg_bps {
+                        score_bps - avg_bps
+                    } else {
+                        avg_bps - score_bps
+                    };
+                    total_deviation_bps = total_deviation_bps.saturating_add(deviation);
                 }
-                sum_sq / total as f64
-            };
-            let std_dev = variance.sqrt();
-            // Lower std dev = more reliable. Score: 1000 - (std_dev * 200)
-            let reliability_score = (1000u32).saturating_sub((std_dev * 200.0) as u32);
+            }
+            let avg_deviation_bps = total_deviation_bps / total as u64;
+            // Max possible avg deviation: (5 - 1) * 1000 / 2 = 2000 bps
+            // Score: 1000 - (avg_deviation_bps * 500 / 1000), capped at [0, 1000]
+            let reliability_score = (1000u32).saturating_sub((avg_deviation_bps * 500 / 1000) as u32);
 
             RatingSummary {
                 total_ratings: total as u32,
