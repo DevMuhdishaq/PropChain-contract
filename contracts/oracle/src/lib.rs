@@ -181,6 +181,13 @@ pub struct PropertyValuationOracle {
         /// Packed source weights: each u64 contains two u32 weights (weight << 32 | weight2)
         /// This reduces storage reads during aggregation
         packed_source_weights: Vec<u64>,
+
+        // ── Median Price Cache (Issue #XXX) ───────────────────────────────────
+        /// Cached median prices: (asset_id, source_class) -> (price, timestamp)
+        cached_median_prices: Mapping<(u64, String), (u128, u64)>,
+        /// Per-asset, per-source-class TTL for the cache (in seconds)
+        cache_ttls: Mapping<(u64, String), u64>,
+
     }
 
     /// A pending multi-sig proposal for a critical oracle operation.
@@ -524,6 +531,10 @@ pub struct PropertyValuationOracle {
                 // Batched aggregation optimization
                 batch_aggregation_enabled: false,
                 packed_source_weights: Vec::new(),
+
+                // Median Price Cache
+                cached_median_prices: Mapping::default(),
+                cache_ttls: Mapping::default(),
             }
         }
 
@@ -547,6 +558,19 @@ pub struct PropertyValuationOracle {
         aggregation::trimmed_mean(&mut values, 10)
     }
 };
+        }
+
+        /// Set the cache TTL for a given asset and source class.
+        #[ink(message)]
+        pub fn set_cache_ttl(
+            &mut self,
+            asset_id: u64,
+            source_class: String,
+            ttl: u64,
+        ) -> Result<(), OracleError> {
+            self.access_control.ensure_caller_has_role(self.admin, Role::OracleAdmin, self.env().block_number(), self.env().block_timestamp()).map_err(|_| OracleError::Unauthorized)?;
+            self.cache_ttls.insert((asset_id, source_class), &ttl);
+            Ok(())
         }
 
         /// Get property valuation with confidence metrics
