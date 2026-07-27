@@ -1,4 +1,3 @@
-
 //! Shared types for PropChain contracts.
 
 // =========================================================================
@@ -26,9 +25,7 @@ pub enum FeeOperation {
 ///
 /// This struct prevents confusion between basis points and other numerical
 /// types, ensuring that fee calculations are handled correctly.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, scale::Encode, scale::Decode,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, scale::Encode, scale::Decode)]
 #[cfg_attr(
     feature = "std",
     derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)

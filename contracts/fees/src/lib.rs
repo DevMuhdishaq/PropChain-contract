@@ -168,9 +168,9 @@ mod propchain_fees {
                 validator_share_bp: BasisPoints::new(5000), // 50% to validators
                 treasury_share_bp: BasisPoints::new(5000),  // 50% to treasury
                 dynamic_fee_config: DynamicFeeConfig {
-                    base_fee_bps: BasisPoints::new(30),           // 0.30 % base
-                    congestion_multiplier: 300, // up to 3× at full utilisation
-                    max_fee_bps: BasisPoints::new(200),           // hard cap at 2.00 %
+                    base_fee_bps: BasisPoints::new(30), // 0.30 % base
+                    congestion_multiplier: 300,         // up to 3× at full utilisation
+                    max_fee_bps: BasisPoints::new(200), // hard cap at 2.00 %
                 },
             }
         }
@@ -450,7 +450,11 @@ mod propchain_fees {
             treasury_share_bp: BasisPoints,
         ) -> Result<(), FeeError> {
             self.ensure_admin()?;
-            if validator_share_bp.get().saturating_add(treasury_share_bp.get()) > BasisPoints::DENOM {
+            if validator_share_bp
+                .get()
+                .saturating_add(treasury_share_bp.get())
+                > BasisPoints::DENOM
+            {
                 return Err(FeeError::InvalidConfig);
             }
             self.validator_share_bp = validator_share_bp;
