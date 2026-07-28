@@ -425,10 +425,7 @@ mod staking {
                         if total_blocks == 0 {
                             0
                         } else {
-                            stake
-                                .original_amount
-                                .saturating_mul(blocks_elapsed)
-                                / total_blocks
+                            stake.original_amount.saturating_mul(blocks_elapsed) / total_blocks
                         }
                     };
                     total_vested.saturating_sub(vesting.vested_amount)
@@ -742,10 +739,7 @@ mod staking {
                         if total_blocks == 0 {
                             0
                         } else {
-                            stake
-                                .original_amount
-                                .saturating_mul(blocks_elapsed)
-                                / total_blocks
+                            stake.original_amount.saturating_mul(blocks_elapsed) / total_blocks
                         }
                     };
                     let claimable = total_vested.saturating_sub(vesting.vested_amount);
@@ -1388,7 +1382,9 @@ mod staking {
         #[ink(message)]
         pub fn slash_validator(&mut self, validator: AccountId) -> Result<(), Error> {
             propchain_traits::non_reentrant!(self, {
-                let coordinator = self.slashing_coordinator.ok_or(Error::NoSlashingCoordinator)?;
+                let coordinator = self
+                    .slashing_coordinator
+                    .ok_or(Error::NoSlashingCoordinator)?;
                 if self.env().caller() != coordinator {
                     return Err(Error::Unauthorized);
                 }
