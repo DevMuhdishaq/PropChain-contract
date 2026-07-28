@@ -159,7 +159,6 @@ mod tests {
     // initiation paths call `ensure_asset_not_frozen`. Until that design
     // decision is made, ignore the test so it doesn't break CI.
     #[ink::test]
-    #[ignore = "token_id-based freeze check is intentionally absent pending a token_id → AccountId mapping design (see TODO in lib.rs)"]
     fn test_asset_freeze_blocks_bridge_initiation() {
         let mut bridge = setup_bridge();
         let accounts = test::default_accounts::<DefaultEnvironment>();

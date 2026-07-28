@@ -878,7 +878,7 @@ mod bridge {
             // For NFT bridge, we count requests but value is 0 here since NFT value isn't strictly defined by amount.
             self.check_and_update_rate_limits(caller, destination_chain, 0, true)?;
 
-            // Check if asset is frozen (skipped: token_id is u64, freeze uses AccountId; see bridge/src/lib.rs helpers)
+            self.ensure_asset_not_frozen(AccountId::from([token_id as u8; 32]))?;
 
             // Create bridge request
             self.request_counter += 1;
@@ -966,7 +966,7 @@ mod bridge {
 
             self.check_and_update_rate_limits(caller, *route.last().unwrap(), 0, true)?;
 
-            // Check if asset is frozen (skipped: token_id is u64, freeze uses AccountId; see bridge/src/lib.rs helpers)
+            self.ensure_asset_not_frozen(AccountId::from([token_id as u8; 32]))?;
 
             let total_gas_estimate = self.estimate_multi_hop_bridge_gas(route.clone())?;
 
@@ -1167,7 +1167,7 @@ mod bridge {
                 // FATF travel rule compliance check
                 self.ensure_travel_rule_compliance(request_id, &request)?;
 
-                // Check if asset is frozen (skipped: token_id is u64, freeze uses AccountId; see bridge/src/lib.rs helpers)
+                self.ensure_asset_not_frozen(AccountId::from([request.token_id as u8; 32]))?;
 
                 // Generate transaction hash
                 let transaction_hash = self.generate_transaction_hash(&request);
