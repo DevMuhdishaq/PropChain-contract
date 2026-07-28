@@ -422,11 +422,11 @@ mod staking {
                     } else {
                         let blocks_elapsed = (now - vesting.cliff_block) as u128;
                         let total_blocks = (vesting.end_block - vesting.start_block) as u128;
-                        if total_blocks == 0 {
-                            0
-                        } else {
-                            stake.original_amount.saturating_mul(blocks_elapsed) / total_blocks
-                        }
+                        stake
+                            .original_amount
+                            .saturating_mul(blocks_elapsed)
+                            .checked_div(total_blocks)
+                            .unwrap_or(0)
                     };
                     total_vested.saturating_sub(vesting.vested_amount)
                 } else {
@@ -736,11 +736,11 @@ mod staking {
                     } else {
                         let blocks_elapsed = (now - vesting.cliff_block) as u128;
                         let total_blocks = (vesting.end_block - vesting.start_block) as u128;
-                        if total_blocks == 0 {
-                            0
-                        } else {
-                            stake.original_amount.saturating_mul(blocks_elapsed) / total_blocks
-                        }
+                        stake
+                            .original_amount
+                            .saturating_mul(blocks_elapsed)
+                            .checked_div(total_blocks)
+                            .unwrap_or(0)
                     };
                     let claimable = total_vested.saturating_sub(vesting.vested_amount);
                     if claimable == 0 {
