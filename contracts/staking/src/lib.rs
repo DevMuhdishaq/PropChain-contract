@@ -415,7 +415,23 @@ mod staking {
             if let Some(stake) = self.stakes.get(staker) {
                 if let Some(vesting) = stake.vesting_schedule {
                     let now = self.env().block_number() as u64;
-                    vesting.claimable_at_block(now)
+                    let total_vested = if now < vesting.cliff_block {
+                        0
+                    } else if now >= vesting.end_block {
+                        stake.original_amount
+                    } else {
+                        let blocks_elapsed = (now - vesting.cliff_block) as u128;
+                        let total_blocks = (vesting.end_block - vesting.start_block) as u128;
+                        if total_blocks == 0 {
+                            0
+                        } else {
+                            stake
+                                .original_amount
+                                .saturating_mul(blocks_elapsed)
+                                / total_blocks
+                        }
+                    };
+                    total_vested.saturating_sub(vesting.vested_amount)
                 } else {
                     0
                 }
@@ -496,6 +512,7 @@ mod staking {
             let stake_info = StakeInfo {
                 staker: caller,
                 amount,
+                original_amount: amount,
                 staked_at: now,
                 lock_until,
                 lock_period,
@@ -579,6 +596,7 @@ mod staking {
             let stake_info = StakeInfo {
                 staker: caller,
                 amount,
+                original_amount: total_reward_amount,
                 staked_at: now,
                 lock_until,
                 lock_period,
@@ -628,6 +646,9 @@ mod staking {
                 let stake = self.stakes.get(caller).ok_or(Error::StakeNotFound)?;
 
                 let now = self.env().block_number() as u64;
+
+                // Lock period is over, or we'll apply early withdrawal penalty
+
                 let amount = stake.amount;
                 let is_early = now < stake.lock_until;
 
@@ -711,7 +732,22 @@ mod staking {
                 // Determine how much can be claimed
                 let claimable_amount = if let Some(vesting) = stake.vesting_schedule {
                     let now = self.env().block_number() as u64;
-                    let total_vested = vesting.calculate_vested_at_block(now);
+                    let total_vested = if now < vesting.cliff_block {
+                        0
+                    } else if now >= vesting.end_block {
+                        stake.original_amount
+                    } else {
+                        let blocks_elapsed = (now - vesting.cliff_block) as u128;
+                        let total_blocks = (vesting.end_block - vesting.start_block) as u128;
+                        if total_blocks == 0 {
+                            0
+                        } else {
+                            stake
+                                .original_amount
+                                .saturating_mul(blocks_elapsed)
+                                / total_blocks
+                        }
+                    };
                     let claimable = total_vested.saturating_sub(vesting.vested_amount);
                     if claimable == 0 {
                         return Err(Error::NoRewards);
@@ -1352,8 +1388,10 @@ mod staking {
         #[ink(message)]
         pub fn slash_validator(&mut self, validator: AccountId) -> Result<(), Error> {
             propchain_traits::non_reentrant!(self, {
-                self.slashing_coordinator
-                    .ok_or(Error::NoSlashingCoordinator)?;
+                let coordinator = self.slashing_coordinator.ok_or(Error::NoSlashingCoordinator)?;
+                if self.env().caller() != coordinator {
+                    return Err(Error::Unauthorized);
+                }
                 if !self.validators.contains(validator) {
                     return Err(Error::ValidatorNotFound);
                 }

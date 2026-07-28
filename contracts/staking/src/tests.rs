@@ -26,7 +26,9 @@ mod tests {
         let accounts = default_accounts();
         set_caller(accounts.alice);
         ink::env::test::set_block_number::<ink::env::DefaultEnvironment>(0);
-        Staking::new(500, 1_000)
+        let mut staking = Staking::new(500, 1_000);
+        staking.set_slashing_coordinator(accounts.alice).unwrap();
+        staking
     }
 
     // ---- Validator Registration ----
@@ -695,12 +697,16 @@ mod tests {
     }
 
     #[ink::test]
-    fn unstake_locked_fails() {
+    fn unstake_locked_applies_penalty() {
         let mut staking = create_staking();
         let accounts = default_accounts();
         set_caller(accounts.bob);
         staking.stake(10_000, LockPeriod::ThirtyDays).unwrap();
-        assert_eq!(staking.unstake(), Err(Error::LockActive));
+        // Unstake early - should succeed (apply penalty instead of blocking)
+        let result = staking.unstake();
+        assert!(result.is_ok());
+        assert_eq!(staking.get_total_staked(), 0);
+        assert!(staking.get_stake(accounts.bob).is_none());
     }
 
     #[ink::test]
@@ -1399,8 +1405,8 @@ fn set_early_withdrawal_penalty_max_cap() {
         let vested_at_cliff = staking.get_vested_amount(accounts.bob);
         assert_eq!(vested_at_cliff, 0); // Still at cliff, no vesting yet
 
-        // Halfway through vesting (block 150, mid-point between 100 and 300)
-        advance_block(50);
+        // Halfway through vesting (block 200, mid-point between 100 and 300)
+        advance_block(100);
         let vested_midpoint = staking.get_vested_amount(accounts.bob);
         assert!(vested_midpoint > 0);
         assert!(vested_midpoint < 1_000_000);
@@ -1462,8 +1468,8 @@ fn set_early_withdrawal_penalty_max_cap() {
             .stake_with_vesting(10_000, LockPeriod::Flexible, 1_000_000, 100, 200)
             .unwrap();
 
-        // Advance to halfway through vesting (block 150, assuming start at 0)
-        advance_block(150);
+        // Advance to halfway through vesting (block 200, halfway between 100 and 300)
+        advance_block(200);
 
         let claimable = staking.get_claimable_vested_amount(accounts.bob);
         assert!(claimable > 0);
