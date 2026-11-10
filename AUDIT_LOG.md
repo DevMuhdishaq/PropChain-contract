@@ -1,5 +1,5 @@
 # 🛡️ Automated Security & Mutation Audit Log
-Generated on: Mon Nov  9 08:52:06 UTC 2026
+Generated on: Tue Nov 10 08:58:03 UTC 2026
 ---
 ## 📦 Dependency License & Advisory Checks (cargo-deny)
 ```text
@@ -31,6 +31,15 @@ cargo-deny failed or flagged warnings
 [0m[0m[1m[31mID:       [0m RUSTSEC-2026-0258
 [0m[0m[1m[31mURL:      [0m https://rustsec.org/advisories/RUSTSEC-2026-0258
 [0m[0m[1m[31mSolution: [0m Upgrade to >=0.4.16
+
+[0m[0m[1m[31mCrate:    [0m libsqlite3-sys
+[0m[0m[1m[31mVersion:  [0m 0.27.0
+[0m[0m[1m[31mTitle:    [0m `libsqlite3-sys` via C SQLite CVE-2026-119375
+[0m[0m[1m[31mDate:     [0m 2026-10-30
+[0m[0m[1m[31mID:       [0m RUSTSEC-2026-0459
+[0m[0m[1m[31mURL:      [0m https://rustsec.org/advisories/RUSTSEC-2026-0459
+[0m[0m[1m[31mSeverity: [0m 6.8 (medium)
+[0m[0m[1m[31mSolution: [0m Upgrade to >=0.39.0
 
 [0m[0m[1m[31mCrate:    [0m rsa
 [0m[0m[1m[31mVersion:  [0m 0.9.10
